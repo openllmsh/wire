@@ -1,0 +1,679 @@
+import type {
+  TAnthropicStreamEvent,
+  TChatCompletionChunk,
+} from "@openllm/schema";
+import { ensureCompactionSafeVisibleText } from "../../features/compaction/compaction-text";
+import { encodeSseEvent } from "../../lib/streaming/sse";
+import { upstreamErrorFrom } from "../../lib/streaming/upstream-error";
+import { plainTextFromReasoningItems } from "./reasoning-from-items";
+import {
+  encodeReasoningSignature,
+  reasoningItemsFromUnknown,
+} from "./reasoning-signature";
+
+/**
+ * Shown as the (collapsed) thinking text when an upstream reasoning
+ * item carries resumable `encrypted_content` but no human summary. The
+ * block still needs *some* text for clients that reject an empty
+ * `thinking` — the value that matters is the `signature` we attach.
+ */
+const REASONING_PLACEHOLDER_TEXT = "[reasoning]";
+
+const stopReasonFor = (
+  finish: TChatCompletionChunk["choices"][number]["finish_reason"],
+): "end_turn" | "max_tokens" | "tool_use" | "refusal" | null => {
+  if (finish === null || finish === undefined) return null;
+  switch (finish) {
+    case "stop":
+      return "end_turn";
+    case "length":
+      return "max_tokens";
+    case "tool_calls":
+    case "function_call":
+      return "tool_use";
+    case "content_filter":
+      return "refusal";
+  }
+};
+
+// runtime-only: stateful translation buffer.
+export type TMessagesStreamState = {
+  startEmitted: boolean;
+  messageId: string;
+  model: string;
+  inputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  /** Anthropic content_index for the text block. null = not yet opened. */
+  textBlockIndex: number | null;
+  /** True while the text block is open (between content_block_start and stop). */
+  textBlockOpen: boolean;
+  /** Responses `reasoning_summary_text.delta` → Anthropic thinking block. */
+  thinkingBlockIndex: number | null;
+  thinkingBlockOpen: boolean;
+  /** OpenAI tool_calls[i].index → Anthropic content_index. */
+  toolCallToContentIndex: Map<number, number>;
+  /** Anthropic content_index → still-open flag. */
+  openToolContentIndexes: Set<number>;
+  /** Next free Anthropic content_index. */
+  nextContentIndex: number;
+  finalStopReason: ReturnType<typeof stopReasonFor>;
+  /**
+   * Concatenation of all `reasoning_content` / thinking deltas. On
+   * terminal chunk, if there was no non-empty `text_delta`, we mirror
+   * this into a synthetic `text` block so Claude Code `/compact` sees
+   * valid user-visible text (same rule as `toAnthropicMessagesResponse`).
+   */
+  thinkingAccumulated: string;
+  /** True after at least one non-empty `content` delta became `text_delta`. */
+  emittedNonemptyTextDelta: boolean;
+  /** Set when `message_stop` is emitted — detects truncated upstream streams. */
+  messageStopEmitted: boolean;
+  /** Concatenation of `delta.content` text deltas (for compaction min-length padding). */
+  textAccumulated: string;
+  /**
+   * How many leading chars of `thinkingAccumulated` were already emitted as
+   * `thinking_delta` events. Keeps streaming aligned when `reasoning_items`
+   * arrives as a snapshot (final chunk only).
+   */
+  thinkingDeltaEmittedLen: number;
+  /**
+   * Encoded `thinking.signature` carrying the upstream's `reasoning`
+   * item(s) (Codex/Responses `encrypted_content`). Set when a chunk
+   * carries `reasoning_items`; flushed onto the thinking block right
+   * before it closes so Claude Code replays it next turn. Without this
+   * the model loses chain-of-thought state and loops forever.
+   */
+  pendingReasoningSignature: string | null;
+  /** True once `signature_delta` has been emitted (emit exactly once). */
+  reasoningSignatureEmitted: boolean;
+};
+
+export const newMessagesStreamState = (): TMessagesStreamState => ({
+  startEmitted: false,
+  messageId: "",
+  model: "",
+  inputTokens: 0,
+  cacheReadTokens: 0,
+  cacheCreationTokens: 0,
+  textBlockIndex: null,
+  textBlockOpen: false,
+  thinkingBlockIndex: null,
+  thinkingBlockOpen: false,
+  toolCallToContentIndex: new Map(),
+  openToolContentIndexes: new Set(),
+  nextContentIndex: 0,
+  finalStopReason: null,
+  thinkingAccumulated: "",
+  emittedNonemptyTextDelta: false,
+  messageStopEmitted: false,
+  textAccumulated: "",
+  thinkingDeltaEmittedLen: 0,
+  pendingReasoningSignature: null,
+  reasoningSignatureEmitted: false,
+});
+
+/**
+ * Emit the reasoning `signature_delta` onto the (still-open) thinking
+ * block so Claude Code replays it verbatim next turn. Anthropic
+ * requires `signature_delta` to be the thinking block's LAST delta,
+ * before `content_block_stop` and before any tool_use block opens — so
+ * this runs the moment `reasoning_items` arrive (Codex sends them on
+ * the reasoning item's `output_item.done`, ahead of the function call).
+ */
+const emitReasoningSignature = (
+  state: TMessagesStreamState,
+  out: TAnthropicStreamEvent[],
+): void => {
+  if (
+    state.pendingReasoningSignature === null ||
+    state.reasoningSignatureEmitted
+  ) {
+    return;
+  }
+  if (!state.thinkingBlockOpen) {
+    // The signed thinking block carries ONLY the Codex/Responses
+    // chain-of-thought STATE (opaque signature). Human-readable
+    // reasoning is streamed separately as visible `text`. Close any
+    // open text / tool block first so content blocks stay strictly
+    // sequential (Anthropic rejects overlapping blocks).
+    closeTextBlock(state, out);
+    closeAllToolBlocks(state, out);
+    const idx = openThinkingBlock(state, out);
+    out.push({
+      type: "content_block_delta",
+      index: idx,
+      delta: { type: "thinking_delta", thinking: REASONING_PLACEHOLDER_TEXT },
+    });
+  }
+  if (state.thinkingBlockIndex !== null) {
+    out.push({
+      type: "content_block_delta",
+      index: state.thinkingBlockIndex,
+      delta: {
+        type: "signature_delta",
+        signature: state.pendingReasoningSignature,
+      },
+    });
+    state.reasoningSignatureEmitted = true;
+  }
+};
+
+const closeThinkingBlock = (
+  state: TMessagesStreamState,
+  out: TAnthropicStreamEvent[],
+): void => {
+  if (state.thinkingBlockOpen && state.thinkingBlockIndex !== null) {
+    out.push({
+      type: "content_block_stop",
+      index: state.thinkingBlockIndex,
+    });
+    state.thinkingBlockOpen = false;
+  }
+};
+
+const openThinkingBlock = (
+  state: TMessagesStreamState,
+  out: TAnthropicStreamEvent[],
+): number => {
+  if (state.thinkingBlockIndex === null) {
+    state.thinkingBlockIndex = state.nextContentIndex;
+    state.nextContentIndex += 1;
+  }
+  if (!state.thinkingBlockOpen) {
+    out.push({
+      type: "content_block_start",
+      index: state.thinkingBlockIndex,
+      content_block: { type: "thinking", thinking: "" },
+    });
+    state.thinkingBlockOpen = true;
+  }
+  return state.thinkingBlockIndex;
+};
+
+const closeTextBlock = (
+  state: TMessagesStreamState,
+  out: TAnthropicStreamEvent[],
+): void => {
+  if (state.textBlockOpen && state.textBlockIndex !== null) {
+    out.push({
+      type: "content_block_stop",
+      index: state.textBlockIndex,
+    });
+    state.textBlockOpen = false;
+  }
+};
+
+const closeAllToolBlocks = (
+  state: TMessagesStreamState,
+  out: TAnthropicStreamEvent[],
+): void => {
+  for (const idx of state.openToolContentIndexes) {
+    out.push({ type: "content_block_stop", index: idx });
+  }
+  state.openToolContentIndexes.clear();
+  // Fresh tool_call deltas must open new content blocks. If reasoning or
+  // another branch stops blocks mid-stream but leaves stale tc.index →
+  // Anthropic index mappings, later `input_json_delta` targets a block we
+  // already emitted `content_block_stop` for — Claude Code sees prose +
+  // truncated pseudo-tools (e.g. literal `<tool_call>` tail).
+  state.toolCallToContentIndex.clear();
+};
+
+const openTextBlock = (
+  state: TMessagesStreamState,
+  out: TAnthropicStreamEvent[],
+): number => {
+  closeThinkingBlock(state, out);
+  // A previously-stopped content index can never be reopened (Anthropic
+  // streaming indices are unique + monotonic). If the text block was
+  // closed — e.g. a signed thinking block or a tool block was emitted
+  // in between — allocate a FRESH index instead of resurrecting the
+  // stopped one.
+  if (state.textBlockIndex === null || !state.textBlockOpen) {
+    state.textBlockIndex = state.nextContentIndex;
+    state.nextContentIndex += 1;
+  }
+  if (!state.textBlockOpen) {
+    out.push({
+      type: "content_block_start",
+      index: state.textBlockIndex,
+      content_block: { type: "text", text: "" },
+    });
+    state.textBlockOpen = true;
+  }
+  return state.textBlockIndex;
+};
+
+/**
+ * Translate one OpenAI ChatCompletion chunk into zero or more
+ * Anthropic SSE events. Handles both text deltas and tool_call deltas:
+ * each new tool_call opens a new content_block(tool_use); subsequent
+ * deltas for that tool_call emit input_json_delta events.
+ */
+export const chunkToMessagesEvents = (
+  chunk: TChatCompletionChunk,
+  state: TMessagesStreamState,
+): TAnthropicStreamEvent[] => {
+  const out: TAnthropicStreamEvent[] = [];
+
+  if (!state.startEmitted) {
+    state.startEmitted = true;
+    state.messageId = chunk.id;
+    state.model = chunk.model;
+    out.push({
+      type: "message_start",
+      message: {
+        id: state.messageId,
+        type: "message",
+        role: "assistant",
+        model: state.model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    });
+  }
+
+  const choice = chunk.choices[0];
+  const deltaReasoning = choice?.delta.reasoning_content ?? null;
+  const deltaText = choice?.delta.content ?? null;
+  const deltaToolCalls = choice?.delta.tool_calls ?? null;
+
+  if (
+    deltaReasoning !== null &&
+    deltaReasoning !== undefined &&
+    deltaReasoning.length > 0
+  ) {
+    // Reasoning text WITHOUT a replay-safe signature must be visible
+    // `text`, never a `thinking` block. Anthropic hard-rejects a
+    // signature-less thinking block the moment Claude Code replays the
+    // assistant turn (`thinking.signature: Field required`), which
+    // triggers a client retry storm and breaks prompt-cache reuse —
+    // draining the user's subscription. The Codex/Responses
+    // chain-of-thought STATE still rides the signed thinking block
+    // opened by `emitReasoningSignature`. `thinkingAccumulated` /
+    // `thinkingDeltaEmittedLen` stay as the reasoning-dedup ledger
+    // shared with the `reasoning_items` snapshot path below.
+    closeAllToolBlocks(state, out);
+    state.thinkingAccumulated += deltaReasoning;
+    const reasoningTail = state.thinkingAccumulated.slice(
+      state.thinkingDeltaEmittedLen,
+    );
+    if (reasoningTail.length > 0) {
+      const idx = openTextBlock(state, out);
+      out.push({
+        type: "content_block_delta",
+        index: idx,
+        delta: { type: "text_delta", text: reasoningTail },
+      });
+      state.thinkingDeltaEmittedLen = state.thinkingAccumulated.length;
+      state.emittedNonemptyTextDelta = true;
+      state.textAccumulated += reasoningTail;
+    }
+  }
+
+  const reasoningItems = reasoningItemsFromUnknown(
+    choice?.delta.reasoning_items,
+  );
+  if (reasoningItems.length > 0) {
+    const sig = encodeReasoningSignature(reasoningItems);
+    if (sig !== null) state.pendingReasoningSignature = sig;
+  }
+
+  const fromReasoningItems = plainTextFromReasoningItems(
+    choice?.delta.reasoning_items,
+  );
+  // The `reasoning_items` snapshot carries the same human-readable
+  // summary as the `reasoning_content` deltas, just delivered as a
+  // growing snapshot. Emit only the clean tail beyond what was already
+  // streamed (as visible `text`, same rule as above). A divergent
+  // snapshot (not a superset of what we already sent) is ignored rather
+  // than re-emitted — we cannot retract already-streamed text, and the
+  // `reasoning_content` deltas already conveyed it.
+  if (
+    fromReasoningItems.length > state.thinkingAccumulated.length &&
+    fromReasoningItems.startsWith(state.thinkingAccumulated)
+  ) {
+    state.thinkingAccumulated = fromReasoningItems;
+    const itemsTail = state.thinkingAccumulated.slice(
+      state.thinkingDeltaEmittedLen,
+    );
+    if (itemsTail.length > 0) {
+      closeAllToolBlocks(state, out);
+      const idx = openTextBlock(state, out);
+      out.push({
+        type: "content_block_delta",
+        index: idx,
+        delta: { type: "text_delta", text: itemsTail },
+      });
+      state.thinkingDeltaEmittedLen = state.thinkingAccumulated.length;
+      state.emittedNonemptyTextDelta = true;
+      state.textAccumulated += itemsTail;
+    }
+  }
+
+  // Reasoning state arrived (Codex `reasoning` item completed) — seal it
+  // onto the thinking block now, while it is still open and before any
+  // tool_use block, so Claude Code replays the `signature` next turn.
+  emitReasoningSignature(state, out);
+
+  // Text delta → open text block (if not already) + content_block_delta.
+  if (deltaText !== null && deltaText !== undefined && deltaText.length > 0) {
+    const idx = openTextBlock(state, out);
+    out.push({
+      type: "content_block_delta",
+      index: idx,
+      delta: { type: "text_delta", text: deltaText },
+    });
+    state.emittedNonemptyTextDelta = true;
+    state.textAccumulated += deltaText;
+  }
+
+  // Tool-call deltas → open tool_use blocks + input_json_delta events.
+  if (deltaToolCalls !== null && deltaToolCalls !== undefined) {
+    for (const tc of deltaToolCalls) {
+      let contentIndex = state.toolCallToContentIndex.get(tc.index);
+      if (contentIndex === undefined) {
+        // First sighting of this tool_call. Anthropic's streaming
+        // protocol requires content blocks be strictly sequential
+        // (`start → deltas → stop` per block, never overlapping), and
+        // Claude Code's parser routes input_json_delta events to the
+        // most-recently-opened tool_use block. If we open a second
+        // tool_use while the previous one is still open, every
+        // subsequent partial_json fragment for the SECOND call is
+        // concatenated onto the FIRST one's input — that's exactly
+        // how `Edit` ends up invoked with all three required fields
+        // missing on multi-tool turns. Close text + any open tool
+        // block before starting the new one.
+        closeTextBlock(state, out);
+        closeAllToolBlocks(state, out);
+        closeThinkingBlock(state, out);
+        contentIndex = state.nextContentIndex;
+        state.nextContentIndex += 1;
+        state.toolCallToContentIndex.set(tc.index, contentIndex);
+        state.openToolContentIndexes.add(contentIndex);
+        out.push({
+          type: "content_block_start",
+          index: contentIndex,
+          content_block: {
+            type: "tool_use",
+            id: tc.id ?? "",
+            name: tc.function?.name ?? "",
+            input: {},
+          },
+        });
+      }
+      const argFragment = tc.function?.arguments ?? "";
+      if (argFragment.length > 0) {
+        out.push({
+          type: "content_block_delta",
+          index: contentIndex,
+          delta: { type: "input_json_delta", partial_json: argFragment },
+        });
+      }
+    }
+  }
+
+  if (chunk.usage != null) {
+    state.inputTokens = chunk.usage.prompt_tokens;
+    state.cacheReadTokens =
+      chunk.usage.prompt_tokens_details?.cached_tokens ?? 0;
+    state.cacheCreationTokens =
+      chunk.usage.prompt_tokens_details?.cache_creation_tokens ?? 0;
+  }
+
+  const turnEnds =
+    choice?.finish_reason !== null && choice?.finish_reason !== undefined;
+
+  // Live token feed: a usage-bearing chunk that does NOT end the turn —
+  // the running estimate synthesized by `withLiveUsageEstimate`, or an
+  // upstream that reports incremental usage — emits a standalone
+  // `message_delta` so a CLI's token counter climbs mid-stream instead
+  // of staying at zero until completion. No `stop_reason`, no
+  // `message_stop`: the turn is still open and the terminal
+  // `message_delta` below reconciles to the provider's exact totals.
+  if (
+    chunk.usage != null &&
+    !turnEnds &&
+    state.startEmitted &&
+    !state.messageStopEmitted
+  ) {
+    out.push({
+      type: "message_delta",
+      delta: { stop_reason: null, stop_sequence: null },
+      usage: {
+        output_tokens: chunk.usage.completion_tokens,
+        input_tokens: state.inputTokens,
+        ...(state.cacheCreationTokens > 0
+          ? { cache_creation_input_tokens: state.cacheCreationTokens }
+          : {}),
+        ...(state.cacheReadTokens > 0
+          ? { cache_read_input_tokens: state.cacheReadTokens }
+          : {}),
+      },
+    });
+  }
+
+  if (choice?.finish_reason !== null && choice?.finish_reason !== undefined) {
+    let finalStopReason = stopReasonFor(choice.finish_reason);
+    // If the upstream emitted tool_call deltas during the stream but
+    // wrongly settled on `finish_reason: "stop"`, override to
+    // `tool_use`. Without this, Claude Code receives a
+    // `stop_reason: "end_turn"` alongside `tool_use` blocks and never
+    // calls the tool back — observed on chatgpt.com Responses API.
+    if (
+      state.toolCallToContentIndex.size > 0 &&
+      (finalStopReason === null || finalStopReason === "end_turn")
+    ) {
+      finalStopReason = "tool_use";
+    }
+    state.finalStopReason = finalStopReason;
+    closeThinkingBlock(state, out);
+    if (state.textBlockOpen && state.textBlockIndex !== null) {
+      const trimmed = state.textAccumulated.trim();
+      if (trimmed.length > 0) {
+        const safe = ensureCompactionSafeVisibleText(state.textAccumulated);
+        if (safe.length > trimmed.length && safe.startsWith(trimmed)) {
+          out.push({
+            type: "content_block_delta",
+            index: state.textBlockIndex,
+            delta: { type: "text_delta", text: safe.slice(trimmed.length) },
+          });
+        }
+      }
+    }
+    closeTextBlock(state, out);
+    closeAllToolBlocks(state, out);
+    if (
+      !state.emittedNonemptyTextDelta &&
+      state.thinkingAccumulated.length > 0
+    ) {
+      const idx = openTextBlock(state, out);
+      out.push({
+        type: "content_block_delta",
+        index: idx,
+        delta: {
+          type: "text_delta",
+          text: ensureCompactionSafeVisibleText(state.thinkingAccumulated),
+        },
+      });
+      closeTextBlock(state, out);
+    }
+
+    const outputTokens = chunk.usage?.completion_tokens ?? 0;
+    out.push({
+      type: "message_delta",
+      delta: {
+        stop_reason: state.finalStopReason,
+        stop_sequence: null,
+      },
+      usage: {
+        output_tokens: outputTokens,
+        input_tokens: state.inputTokens,
+        ...(state.cacheCreationTokens > 0
+          ? { cache_creation_input_tokens: state.cacheCreationTokens }
+          : {}),
+        ...(state.cacheReadTokens > 0
+          ? { cache_read_input_tokens: state.cacheReadTokens }
+          : {}),
+      },
+    });
+    out.push({ type: "message_stop" });
+    state.messageStopEmitted = true;
+  }
+  return out;
+};
+
+/**
+ * Encode an Anthropic stream event as SSE bytes. Anthropic uses an
+ * `event: <name>\n` prefix line (not just `data:` like OpenAI), so we
+ * can't reuse `encodeSseEvent` directly.
+ */
+export const encodeAnthropicSseEvent = (
+  event: TAnthropicStreamEvent,
+): Uint8Array => {
+  const lines = `event: ${event.type}\n`;
+  const body = encodeSseEvent(event);
+  const prefix = new TextEncoder().encode(lines);
+  const out = new Uint8Array(prefix.byteLength + body.byteLength);
+  out.set(prefix, 0);
+  out.set(body, prefix.byteLength);
+  return out;
+};
+
+/**
+ * Pipe a stream of OpenAI ChatCompletion chunks into Anthropic-format
+ * SSE bytes. Used by the `/v1/messages` handler when the runner
+ * returned a streaming outcome.
+ */
+export const chunksToMessagesSseBytes = (
+  chunks: ReadableStream<TChatCompletionChunk>,
+): ReadableStream<Uint8Array> => {
+  const reader = chunks.getReader();
+  const state = newMessagesStreamState();
+  const buffer: Uint8Array[] = [];
+  // One-chunk lookahead. The OpenAI streaming spec delivers token
+  // counts in a SEPARATE trailing chunk (`choices: []`, `usage` set,
+  // emitted under `stream_options.include_usage`) that arrives AFTER
+  // the `finish_reason` chunk. The terminal `message_delta` is built
+  // from the finish chunk, so without folding that trailing usage in
+  // first the CLI feed gets `usage:{input_tokens:0,output_tokens:0}` —
+  // i.e. no token counter once you go through the proxy. Providers
+  // that already put usage on the finish chunk are untouched.
+  let pending: TChatCompletionChunk | null = null;
+  const readChunk = async (): Promise<
+    { value: TChatCompletionChunk; done: false } | { done: true }
+  > => {
+    if (pending !== null) {
+      const v = pending;
+      pending = null;
+      return { value: v, done: false };
+    }
+    const r = await reader.read();
+    return r.done ? { done: true } : { value: r.value, done: false };
+  };
+  const isUsageOnly = (c: TChatCompletionChunk): boolean =>
+    c.choices.length === 0 && c.usage != null;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        for (;;) {
+          if (buffer.length > 0) {
+            const next = buffer.shift();
+            if (next !== undefined) controller.enqueue(next);
+            return;
+          }
+          const read = await readChunk();
+          if (read.done) {
+            if (state.startEmitted && !state.messageStopEmitted) {
+              // Upstream ended WITHOUT a finish_reason — the stream was
+              // cut (Vercel maxDuration hard-kill, provider drop,
+              // client/network abort). This terminal is synthetic: we
+              // do NOT know the turn completed. It must signal
+              // truncation (`length` → Anthropic `max_tokens`), never
+              // `stop`. `stop` maps to `end_turn`, which the
+              // tool_use override (chunkToMessagesEvents) promotes to
+              // `stop_reason: "tool_use"` whenever a tool block was
+              // opened — promising Claude Code an executable tool whose
+              // `input_json_delta` is a truncated, unparseable JSON
+              // fragment. Claude Code then blocks forever trying to
+              // JSON.parse it ("announced an action then froze"). With
+              // `length` the override (null/end_turn only) does not
+              // fire, the client sees an honest cut turn and re-prompts
+              // to resume — same contract as `withStreamDeadline`.
+              const tail = chunkToMessagesEvents(
+                {
+                  id:
+                    state.messageId !== ""
+                      ? state.messageId
+                      : "chatcmpl-truncated",
+                  object: "chat.completion.chunk",
+                  created: Math.floor(Date.now() / 1000),
+                  model: state.model !== "" ? state.model : "unknown",
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {},
+                      finish_reason: "length",
+                    },
+                  ],
+                },
+                state,
+              );
+              for (const e of tail) {
+                buffer.push(encodeAnthropicSseEvent(e));
+              }
+            }
+            while (buffer.length > 0) {
+              const next = buffer.shift();
+              if (next !== undefined) controller.enqueue(next);
+            }
+            controller.close();
+            return;
+          }
+          let value = read.value;
+          // If this chunk ends the turn but has no usage yet, peek the
+          // next one: a trailing usage-only chunk gets folded in so the
+          // terminal `message_delta` carries real input/output/cache
+          // tokens. Anything else is stashed and processed next.
+          const endsTurn = value.choices.some(
+            (c) => c.finish_reason != null && c.finish_reason !== undefined,
+          );
+          if (endsTurn && value.usage == null) {
+            const la = await readChunk();
+            if (!la.done) {
+              if (isUsageOnly(la.value)) {
+                value = { ...value, usage: la.value.usage };
+              } else {
+                pending = la.value;
+              }
+            }
+          }
+          const events = chunkToMessagesEvents(value, state);
+          for (const e of events) buffer.push(encodeAnthropicSseEvent(e));
+        }
+      } catch (err) {
+        // Upstream errored mid-stream — for example Anthropic's
+        // `event: error` (overloaded_error/api_error). Surface as an
+        // Anthropic-format error event so Claude Code sees a clean
+        // failure rather than an abruptly closed stream (which is
+        // exactly what manifested as "compaction fails at 20%").
+        const { type, message } = upstreamErrorFrom(err);
+        buffer.push(
+          encodeAnthropicSseEvent({
+            type: "error",
+            error: { type, message },
+          }),
+        );
+        const next = buffer.shift();
+        if (next !== undefined) controller.enqueue(next);
+        controller.close();
+      }
+    },
+    cancel(reason) {
+      reader.cancel(reason).catch(() => {});
+    },
+  });
+};

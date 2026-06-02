@@ -1,0 +1,19 @@
+{
+  "name": "@openllm/wire",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./adapters/messages": "./adapters/messages/index.ts",
+    "./adapters/responses": "./adapters/responses/index.ts",
+    "./providers/anthropic": "./providers/anthropic/index.ts",
+    "./providers/chatgpt": "./providers/chatgpt/index.ts",
+    "./*": "./*.ts"
+  },
+  "dependencies": {
+    "@openllm/schema": "workspace:*",
+    "effect": "*"
+  },
+  "license": "BUSL-1.1"
+}
