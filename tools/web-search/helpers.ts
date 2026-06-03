@@ -13,6 +13,15 @@ import type {
  * `webSearchTool.handle` rely on.
  */
 
+/**
+ * Upper bound on agentic web_search rounds per hop — bounds a misbehaving
+ * model that keeps requesting searches without ever answering. Shared by
+ * the cloud orchestrator (`@openllm/core` `applyToolHandlers`) and the
+ * coreless daemon walker so both paths agent to the same depth and fail
+ * the same way on exhaustion.
+ */
+export const MAX_WEB_SEARCH_ROUNDS = 4;
+
 export const WEB_SEARCH_NAMES = new Set([
   "web_search",
   "WebSearch",
