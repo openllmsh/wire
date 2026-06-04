@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@openllm/schema": "workspace:*",
-    "effect": "*"
+    "effect": ">=3.20.0"
   },
   "license": "BUSL-1.1"
 }
