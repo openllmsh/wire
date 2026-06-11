@@ -39,6 +39,19 @@ const ANTHROPIC_BLOCKED_BETAS: ReadonlySet<string> = new Set<string>();
 /** Beta required for the subscription-OAuth (`sk-ant-oat01-…`) path. */
 export const ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20";
 
+/**
+ * Anthropic SUBSCRIPTION / OAuth credential matcher — the `claude setup-token`
+ * and "Sign in with Claude" tokens. These ride `Authorization: Bearer` + the
+ * oauth beta header, NOT `x-api-key` (which is for Console keys `sk-ant-api03-`).
+ * Anthropic has shipped TWO prefixes over time: the original `sk-ant-oat01-` and
+ * the current `sk-ant-at01-` (Claude CLI ≥ 2.1.x) — match BOTH, never a Console
+ * key. Single source of truth for the daemon (setup-token capture + validation)
+ * and the cloud (auth-header split, terms gate, count-tokens).
+ */
+export const ANTHROPIC_OAUTH_TOKEN_RE = /sk-ant-o?at01-[A-Za-z0-9_-]+/;
+export const isAnthropicOAuthToken = (token: string): boolean =>
+  /^sk-ant-o?at01-/.test(token);
+
 const splitBetaHeader = (raw: string | null): string[] => {
   if (raw === null) return [];
   return raw
