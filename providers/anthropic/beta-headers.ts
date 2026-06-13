@@ -1,4 +1,4 @@
-import type { TAnthropicRequest } from "@openllm/schema";
+import type { TAnthropicRequest } from "@quantidexyz/openllmp";
 
 /**
  * Anthropic `anthropic-beta` header policy.

@@ -4,7 +4,7 @@ import type {
   TAnthropicStopReason,
   TChatCompletionResponse,
   TToolCall,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 import { ensureCompactionSafeVisibleText } from "../../features/compaction/compaction-text";
 import { parseToolArguments } from "../../lib/canonical/message";
 import { plainTextFromReasoningItems } from "./reasoning-from-items";

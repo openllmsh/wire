@@ -1,7 +1,7 @@
 import type {
   TChatCompletionChunk,
   TChatGptProviderOptions,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 import {
   buildReasoningItem,
   type TReasoningItem,

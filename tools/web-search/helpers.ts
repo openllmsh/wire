@@ -2,7 +2,7 @@ import type {
   TChatCompletionResponse,
   TChatMessage,
   TToolCall,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 
 /**
  * Pure helpers for the web-search tool — no DB, no fetch. The

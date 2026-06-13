@@ -4,12 +4,12 @@ import type {
   TResponsesInputItem,
   TResponsesRequest,
   TToolCall,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 
 /**
  * Inbound adapter: OpenAI **Responses API** request → canonical
  * ChatCompletion request. The inverse of `toChatGptRequest`
- * (`@openllm/wire/providers/chatgpt/request.ts`), so a Codex client (which
+ * (`@quantidexyz/openllmw/providers/chatgpt/request.ts`), so a Codex client (which
  * speaks only the Responses API) can drive the gateway's normal pipeline.
  *
  *  - `instructions`            → a leading `system` message.

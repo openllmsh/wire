@@ -1,7 +1,7 @@
-import type { TErrorEnvelope } from "@openllm/schema";
+import type { TErrorEnvelope } from "@quantidexyz/openllmp";
 
 /**
- * Per-hop upstream-error classification. Lives in `@openllm/wire` (pure,
+ * Per-hop upstream-error classification. Lives in `@quantidexyz/openllmw` (pure,
  * schema-only) so the cloud orchestrator (`@openllm/core`) and the coreless
  * daemon walker share ONE definition of "transient" instead of forking it.
  *

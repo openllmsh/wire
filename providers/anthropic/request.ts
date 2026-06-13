@@ -7,7 +7,7 @@ import type {
   TChatCompletionRequest,
   TChatMessage,
   TToolCall,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 import {
   extractMessageText,
   parseToolArguments,

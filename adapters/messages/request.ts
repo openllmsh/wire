@@ -6,7 +6,7 @@ import type {
   TChatCompletionRequest,
   TChatMessage,
   TToolCall,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 import { decodeReasoningSignature } from "./reasoning-signature";
 
 const extractTextFromBlocks = (

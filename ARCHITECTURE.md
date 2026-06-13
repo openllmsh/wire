@@ -2,10 +2,10 @@
 
 > `@openllm/wire` — the **pure wire-format transforms** shared by the
 > cloud proxy pipeline (`packages/core`) and the local subscription
-> daemon (`packages/daemon`). Depends only on `@openllm/schema`: **no
+> daemon (`packages/daemon`). Depends only on `@quantidexyz/openllmp`: **no
 > Effect-DI, no provider registry, no `fetch`, no HTTP framework, no
 > DB.** Every export is a deterministic function (or a small stateful
-> stream transform) over `@openllm/schema` wire types.
+> stream transform) over `@quantidexyz/openllmp` wire types.
 >
 > Extracted from `packages/core` per
 > [`docs/proposals/coreless-daemon-passthrough.md`](../../docs/proposals/coreless-daemon-passthrough.md)
@@ -20,7 +20,7 @@ The daemon must adapt a request to each hop's wire, encode the response
 back, and synthesize usage — **without** linking the whole `core`
 pipeline (the runner + provider graph + Effect-DI layers). Those
 transforms were already pure functions inside `core`; pulling them into
-a `@openllm/schema`-only package lets the daemon import them directly and
+a `@quantidexyz/openllmp`-only package lets the daemon import them directly and
 lets `core`'s churn (new providers, runner fixes) stop forcing a daemon
 re-ship. `core` re-imports them — the move is **zero behaviour change**,
 pinned by the existing `tests/{inbound,outbound}-*` + matrix suites.
@@ -51,7 +51,7 @@ wire/
 
 ## Layering rules
 
-- Depends **only** on `@openllm/schema`. No `@openllm/core`, no
+- Depends **only** on `@quantidexyz/openllmp`. No `@openllm/core`, no
   `@openllm/api`/`db`/`vault`, no `effect` runtime (Layer/Context/Effect),
   no Next/Vercel. (Schema types only; `effect`'s `Schema` decode lives in
   `core/lib/streaming/event-stream.ts`, which is deliberately **not** part

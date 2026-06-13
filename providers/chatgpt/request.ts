@@ -2,7 +2,7 @@ import type {
   TChatCompletionRequest,
   TChatGptProviderOptions,
   TChatMessage,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 import {
   reasoningItemsFromUnknown,
   reasoningItemToResponsesInput,

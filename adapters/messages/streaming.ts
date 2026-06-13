@@ -1,7 +1,7 @@
 import type {
   TAnthropicStreamEvent,
   TChatCompletionChunk,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 import { ensureCompactionSafeVisibleText } from "../../features/compaction/compaction-text";
 import { encodeSseEvent } from "../../lib/streaming/sse";
 import { upstreamErrorFrom } from "../../lib/streaming/upstream-error";

@@ -1,7 +1,7 @@
 import type {
   TChatCompletionChunk,
   TChatCompletionResponse,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 
 /**
  * Claude Code `/compact` uses `Xm()` which requires usable summary text.

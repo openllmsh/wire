@@ -2,7 +2,7 @@ import type {
   TChatCompletionChunk,
   TChatCompletionResponse,
   TToolCall,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 
 import { plainTextFromReasoningItems } from "../../adapters/messages/reasoning-from-items";
 

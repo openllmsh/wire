@@ -1,7 +1,7 @@
 import type {
   TChatCompletionChunk,
   TChatCompletionResponse,
-} from "@openllm/schema";
+} from "@quantidexyz/openllmp";
 
 /**
  * Turn a finished canonical response into a one-shot chunk stream so an

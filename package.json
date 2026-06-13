@@ -1,7 +1,7 @@
 {
-  "name": "@openllm/wire",
+  "name": "@quantidexyz/openllmw",
   "version": "0.0.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "exports": {
     ".": "./index.ts",
@@ -12,7 +12,7 @@
     "./*": "./*.ts"
   },
   "dependencies": {
-    "@openllm/schema": "workspace:*",
+    "@quantidexyz/openllmp": "workspace:*",
     "effect": ">=3.20.0"
   },
   "license": "BUSL-1.1"
