@@ -62,9 +62,15 @@ export const canonicalToUpstreamBody = (
   canonical: TChatCompletionRequest,
   providerModelId: string,
   stream: boolean,
+  // Whether the chatgpt (Responses) encode injects the Codex preamble. Undefined
+  // → inject (Codex default); `false` suppresses it for non-Codex Responses-wire
+  // providers (xAI Grok). No effect for the anthropic / openai wires.
+  codexInstructions?: boolean,
 ): unknown => {
+  if (upstreamWire === "chatgpt") {
+    return toChatGptRequest(canonical, { providerModelId, codexInstructions });
+  }
   const options = { providerModelId };
-  if (upstreamWire === "chatgpt") return toChatGptRequest(canonical, options);
   if (upstreamWire === "anthropic") {
     return { ...toAnthropicRequest(canonical, options), stream };
   }
@@ -87,6 +93,8 @@ export const buildUpstreamBody = (
   // `undefined` → PRESERVE the body's own stream flag (the cloud passthrough
   // forwards verbatim); a boolean pins it (the daemon, off the 307's intent).
   stream: boolean | undefined,
+  // Codex-preamble injection for the chatgpt wire (see canonicalToUpstreamBody).
+  codexInstructions?: boolean,
 ): unknown => {
   // Passthrough: same wire in + out (NEVER for `responses` — its body is
   // Responses-shaped). Only the model id + stream flag are pinned. The
@@ -114,6 +122,7 @@ export const buildUpstreamBody = (
     canonicalFromInbound(surface, rawBody),
     providerModelId,
     stream ?? false,
+    codexInstructions,
   );
 };
 
@@ -171,6 +180,12 @@ export type TBuildUpstreamRequestInput = {
   readonly isOAuth?: boolean;
   /** Pinned `anthropic-version` (else the ground-floor default). */
   readonly apiVersion?: string;
+  /**
+   * chatgpt-wire only: inject the Codex preamble. Undefined → inject (Codex
+   * default); `false` suppresses it for a non-Codex Responses-wire provider
+   * (xAI Grok). See {@link canonicalToUpstreamBody}.
+   */
+  readonly codexInstructions?: boolean;
 };
 
 /**
@@ -207,6 +222,7 @@ export const buildUpstreamRequest = (
     i.rawBody,
     i.providerModelId,
     i.stream,
+    i.codexInstructions,
   ),
   headers: buildUpstreamHeaders(i),
 });

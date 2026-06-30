@@ -320,8 +320,16 @@ export const toChatGptRequest = (
     req.messages,
   );
 
+  // The Codex preamble is a Codex IDENTITY required by the ChatGPT backend, but
+  // wrong for other providers on the same Responses wire (xAI Grok). Inject it
+  // only when the caller wants it — `codexInstructions !== false` (undefined =
+  // inject, preserving every existing chatgpt caller). When suppressed, only the
+  // user's OWN system messages (`fromSystem`) ride in `instructions`.
   let instructions = fromSystem;
-  if (!instructions.includes(CHATGPT_DEFAULT_INSTRUCTIONS)) {
+  if (
+    options.codexInstructions !== false &&
+    !instructions.includes(CHATGPT_DEFAULT_INSTRUCTIONS)
+  ) {
     instructions =
       instructions.length > 0
         ? `${CHATGPT_DEFAULT_INSTRUCTIONS}\n\n${instructions}`
