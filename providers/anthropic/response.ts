@@ -27,13 +27,19 @@ const finishReasonFor = (
   }
 };
 
+// Anthropic's `input_tokens` EXCLUDES cache reads and cache-creation tokens
+// (they get their own fields); canonical `prompt_tokens` INCLUDES them, with
+// the split kept in `prompt_tokens_details`. Fold them in — `calcCost` and
+// `toAnthropicMessagesResponse` both subtract them back out, so leaving them
+// out drops cached prompt tokens from usage and zeroes the fresh-input cost.
 const usageFor = (u: TAnthropicUsage): TUsage => {
   const cached = u.cache_read_input_tokens ?? 0;
   const created = u.cache_creation_input_tokens ?? 0;
+  const promptTokens = u.input_tokens + cached + created;
   return {
-    prompt_tokens: u.input_tokens,
+    prompt_tokens: promptTokens,
     completion_tokens: u.output_tokens,
-    total_tokens: u.input_tokens + u.output_tokens,
+    total_tokens: promptTokens + u.output_tokens,
     ...(cached > 0 || created > 0
       ? {
           prompt_tokens_details: {

@@ -208,10 +208,15 @@ export const fromAnthropicStreamEvent = (
 
   if (event.type === "message_delta") {
     const finish = finishReasonFor(event.delta.stop_reason);
+    // `state.inputTokens` holds Anthropic's `input_tokens`, which EXCLUDES the
+    // cache fields. Canonical `prompt_tokens` includes them — see `usageFor`
+    // in ./response.ts.
+    const promptTokens =
+      state.inputTokens + state.cacheReadTokens + state.cacheCreationTokens;
     const usage: TUsage = {
-      prompt_tokens: state.inputTokens,
+      prompt_tokens: promptTokens,
       completion_tokens: event.usage.output_tokens,
-      total_tokens: state.inputTokens + event.usage.output_tokens,
+      total_tokens: promptTokens + event.usage.output_tokens,
       ...(state.cacheCreationTokens > 0 || state.cacheReadTokens > 0
         ? {
             prompt_tokens_details: {
