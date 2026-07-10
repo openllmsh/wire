@@ -39,6 +39,12 @@ type TResponsesContentPart =
       readonly type: "input_image";
       readonly image_url: string;
       readonly detail?: "auto" | "low" | "high";
+    }
+  | {
+      readonly type: "input_file";
+      readonly filename?: string;
+      readonly file_data?: string;
+      readonly file_id?: string;
     };
 
 // runtime-only: a single item in the Responses API `input` array.
@@ -79,6 +85,21 @@ const contentToInputParts = (
         image_url: block.image_url.url,
         ...(block.image_url.detail !== undefined
           ? { detail: block.image_url.detail }
+          : {}),
+      });
+    } else if (block.type === "file") {
+      // Responses `input_file.file_data` is a data URL — same encoding
+      // as the canonical file part, so it copies through directly.
+      parts.push({
+        type: "input_file",
+        ...(block.file.filename !== undefined
+          ? { filename: block.file.filename }
+          : {}),
+        ...(block.file.file_data !== undefined
+          ? { file_data: block.file.file_data }
+          : {}),
+        ...(block.file.file_id !== undefined
+          ? { file_id: block.file.file_id }
           : {}),
       });
     }

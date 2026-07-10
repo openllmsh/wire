@@ -33,6 +33,14 @@ type TCanonicalContentPart =
         readonly url: string;
         readonly detail?: "auto" | "low" | "high";
       };
+    }
+  | {
+      readonly type: "file";
+      readonly file: {
+        readonly file_data?: string;
+        readonly file_id?: string;
+        readonly filename?: string;
+      };
     };
 
 type TResponsesContentPart = Extract<
@@ -57,6 +65,15 @@ const toCanonicalContent = (
           ...(p.detail !== undefined ? { detail: p.detail } : {}),
         },
       });
+    } else if (p.type === "input_file") {
+      parts.push({
+        type: "file",
+        file: {
+          ...(p.file_data !== undefined ? { file_data: p.file_data } : {}),
+          ...(p.file_id != null ? { file_id: p.file_id } : {}),
+          ...(p.filename !== undefined ? { filename: p.filename } : {}),
+        },
+      });
     }
   }
   return parts;
@@ -65,7 +82,11 @@ const toCanonicalContent = (
 /** Flatten Responses content to plain text (for `tool` message bodies). */
 const contentToText = (content: TResponsesContentPart): string => {
   if (typeof content === "string") return content;
-  return content.map((p) => (p.type === "input_image" ? "" : p.text)).join("");
+  return content
+    .map((p) =>
+      p.type === "input_text" || p.type === "output_text" ? p.text : "",
+    )
+    .join("");
 };
 
 /**

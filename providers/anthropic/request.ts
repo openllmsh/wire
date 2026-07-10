@@ -43,11 +43,12 @@ const withCacheControl = <T extends TAnthropicContentBlock>(
 ): T => (cc === undefined ? block : { ...block, cache_control: cc });
 
 /**
- * Anthropic accepts `cache_control` on text / image / tool_use /
- * tool_result blocks — never on thinking. A message-level breakpoint
- * applies to the message's LAST cache-eligible block (LiteLLM folds
- * `message["cache_control"]` onto the final content element). Don't
- * clobber a block that already carries its own part-level breakpoint.
+ * Anthropic accepts `cache_control` on text / image / document /
+ * search_result / tool_use / tool_result blocks — never on thinking. A
+ * message-level breakpoint applies to the message's LAST cache-eligible
+ * block (LiteLLM folds `message["cache_control"]` onto the final
+ * content element). Don't clobber a block that already carries its own
+ * part-level breakpoint.
  */
 const applyMessageCacheControl = (
   blocks: TAnthropicContentBlock[],
@@ -60,6 +61,8 @@ const applyMessageCacheControl = (
     if (
       b.type === "text" ||
       b.type === "image" ||
+      b.type === "document" ||
+      b.type === "search_result" ||
       b.type === "tool_use" ||
       b.type === "tool_result"
     ) {
@@ -71,6 +74,50 @@ const applyMessageCacheControl = (
 
 const DATA_URL_RE = /^data:([^;,]+);base64,(.*)$/;
 
+/** Runtime-agnostic base64 → UTF-8 (browser, node, bun). */
+const decodeBase64Utf8 = (b64: string): string => {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+};
+
+/**
+ * Map a base64 payload + media type to the Anthropic block that can
+ * legally carry it: PDFs → base64 document source, text/plain → text
+ * document source, anything else → text annotation. (Anthropic only
+ * accepts `application/pdf` for base64 documents and `text/plain` for
+ * text documents.)
+ */
+const base64ToDocumentBlock = (
+  mediaType: string,
+  data: string,
+  title: string | undefined,
+): TAnthropicContentBlock => {
+  if (mediaType === "application/pdf") {
+    return {
+      type: "document",
+      source: { type: "base64", media_type: mediaType, data },
+      ...(title !== undefined ? { title } : {}),
+    };
+  }
+  if (mediaType === "text/plain") {
+    return {
+      type: "document",
+      source: {
+        type: "text",
+        media_type: "text/plain",
+        data: decodeBase64Utf8(data),
+      },
+      ...(title !== undefined ? { title } : {}),
+    };
+  }
+  return {
+    type: "text",
+    text: `[file content omitted — unsupported media type ${mediaType}]`,
+  };
+};
+
 const imageUrlToAnthropicBlock = (
   url: string,
   cc: TCacheControl | undefined,
@@ -79,6 +126,16 @@ const imageUrlToAnthropicBlock = (
   if (m !== null) {
     const mediaType = m[1] ?? "image/png";
     const data = m[2] ?? "";
+    // Some OpenAI-format clients (LiteLLM among them) smuggle PDFs and
+    // other files through `image_url` data URLs. A non-image media type
+    // would make an invalid Anthropic image block — route it to the
+    // block type that can carry it instead.
+    if (!mediaType.startsWith("image/")) {
+      return withCacheControl(
+        base64ToDocumentBlock(mediaType, data, undefined),
+        cc,
+      );
+    }
     return withCacheControl(
       {
         type: "image",
@@ -88,6 +145,42 @@ const imageUrlToAnthropicBlock = (
     );
   }
   return withCacheControl({ type: "image", source: { type: "url", url } }, cc);
+};
+
+const filePartToAnthropicBlock = (part: {
+  readonly file: {
+    readonly file_data?: string;
+    readonly file_id?: string;
+    readonly filename?: string;
+  };
+}): TAnthropicContentBlock => {
+  const { file_data, file_id, filename } = part.file;
+  if (file_data !== undefined) {
+    const m = DATA_URL_RE.exec(file_data);
+    if (m !== null) {
+      return base64ToDocumentBlock(
+        m[1] ?? "application/octet-stream",
+        m[2] ?? "",
+        filename,
+      );
+    }
+    return {
+      type: "text",
+      text: "[file content omitted — file_data was not a base64 data URL]",
+    };
+  }
+  if (file_id !== undefined) {
+    // Anthropic Files API source (beta) — pass the reference through.
+    return {
+      type: "document",
+      source: { type: "file", file_id },
+      ...(filename !== undefined ? { title: filename } : {}),
+    };
+  }
+  return {
+    type: "text",
+    text: "[file content omitted — file part carried neither file_data nor file_id]",
+  };
 };
 
 const contentToBlocks = (
@@ -114,6 +207,15 @@ const contentToBlocks = (
     if (part.type === "image_url") {
       out.push(
         imageUrlToAnthropicBlock(part.image_url.url, readCacheControl(part)),
+      );
+      continue;
+    }
+    if (part.type === "file") {
+      out.push(
+        withCacheControl(
+          filePartToAnthropicBlock(part),
+          readCacheControl(part),
+        ),
       );
       continue;
     }

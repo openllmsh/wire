@@ -25,7 +25,71 @@ type TCanonicalContentPart =
   | {
       readonly type: "image_url";
       readonly image_url: { readonly url: string };
+    }
+  | {
+      readonly type: "file";
+      readonly file: {
+        readonly file_data?: string;
+        readonly file_id?: string;
+        readonly filename?: string;
+      };
     };
+
+/** Pull the text out of an opaque custom-content document source. */
+const extractTextFromUnknownContent = (content: unknown): string => {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter(
+      (b): b is { type: "text"; text: string } =>
+        typeof b === "object" &&
+        b !== null &&
+        (b as { type?: unknown }).type === "text" &&
+        typeof (b as { text?: unknown }).text === "string",
+    )
+    .map((b) => b.text)
+    .join("\n");
+};
+
+const documentToCanonicalPart = (
+  block: Extract<TAnthropicContentBlock, { type: "document" }>,
+): TCanonicalContentPart => {
+  const src = block.source;
+  if (src.type === "base64") {
+    return {
+      type: "file",
+      file: {
+        file_data: `data:${src.media_type};base64,${src.data}`,
+        ...(block.title != null ? { filename: block.title } : {}),
+      },
+    };
+  }
+  if (src.type === "file") {
+    return { type: "file", file: { file_id: src.file_id } };
+  }
+  if (src.type === "text") {
+    // Plain-text documents ARE text — carry the content directly.
+    return { type: "text", text: src.data };
+  }
+  if (src.type === "content") {
+    const text = extractTextFromUnknownContent(src.content);
+    return {
+      type: "text",
+      text:
+        text.length > 0
+          ? text
+          : "[document omitted — custom-content document had no extractable text]",
+    };
+  }
+  // url source — the wire layer is pure (no fetch) and OpenAI file parts
+  // have no URL form, so degrade to an annotation. Anthropic→Anthropic
+  // passthrough keeps URL documents working; only cross-provider hops
+  // land here.
+  return {
+    type: "text",
+    text: `[document omitted — URL documents are not supported by this provider: ${src.url}]`,
+  };
+};
 
 const blockToCanonicalPart = (
   block: TAnthropicContentBlock,
@@ -45,6 +109,31 @@ const blockToCanonicalPart = (
         },
       };
     }
+    // file_id image source — OpenAI image_url has no file-reference
+    // form, so annotate rather than silently dropping the image.
+    return {
+      type: "text",
+      text: "[image omitted — file_id image sources are not supported by this provider]",
+    };
+  }
+  if (block.type === "document") {
+    return documentToCanonicalPart(block);
+  }
+  if (block.type === "search_result") {
+    // No canonical carrier for citable search results — degrade to a
+    // readable text rendering (citations are dropped cross-provider;
+    // Anthropic→Anthropic passthrough keeps them intact).
+    const body = block.content.map((b) => b.text).join("\n");
+    return {
+      type: "text",
+      text: `[search result] ${block.title} (${block.source})\n${body}`,
+    };
+  }
+  if (block.type === "container_upload") {
+    return {
+      type: "text",
+      text: "[container upload omitted — code-execution file references are not supported by this provider]",
+    };
   }
   return null;
 };
@@ -54,6 +143,12 @@ const blocksToCanonicalContent = (
 ): string | ReadonlyArray<TCanonicalContentPart> => {
   const parts: TCanonicalContentPart[] = [];
   for (const b of blocks) {
+    // A document's `context` is retrieval metadata the model should
+    // still see — surface it as a preceding text part so it isn't lost
+    // on cross-provider hops.
+    if (b.type === "document" && b.context != null && b.context.length > 0) {
+      parts.push({ type: "text", text: b.context });
+    }
     const p = blockToCanonicalPart(b);
     if (p !== null) parts.push(p);
   }
@@ -92,13 +187,24 @@ const toolResultContentToString = (
   content: Extract<TAnthropicContentBlock, { type: "tool_result" }>["content"],
 ): string => {
   if (typeof content === "string") return content;
-  // A tool_result may carry image blocks alongside text — the canonical
-  // OpenAI `role: "tool"` message is text-only, so keep the text and
-  // annotate the images rather than leaking `undefined` into the join.
+  // A tool_result may carry image / document / search_result blocks
+  // alongside text — the canonical OpenAI `role: "tool"` message is
+  // text-only, so keep the text and annotate the rest rather than
+  // leaking `undefined` into the join.
   return content
-    .map((b) =>
-      b.type === "text" ? b.text : "[image content omitted from tool result]",
-    )
+    .map((b) => {
+      if (b.type === "text") return b.text;
+      if (b.type === "document") {
+        return b.source.type === "text"
+          ? b.source.data
+          : "[document content omitted from tool result]";
+      }
+      if (b.type === "search_result") {
+        const body = b.content.map((t) => t.text).join("\n");
+        return `[search result] ${b.title} (${b.source})\n${body}`;
+      }
+      return "[image content omitted from tool result]";
+    })
     .join("\n");
 };
 
