@@ -1,4 +1,7 @@
-import type { TAnthropicRequest } from "@quantidexyz/openllmp";
+import type {
+  TAnthropicContentBlock,
+  TAnthropicRequest,
+} from "@quantidexyz/openllmp";
 
 /**
  * Anthropic `anthropic-beta` header policy.
@@ -63,22 +66,28 @@ const splitBetaHeader = (raw: string | null): string[] => {
 /** Beta required for Files-API (`file_id`) sources on image/document blocks. */
 export const ANTHROPIC_FILES_API_BETA = "files-api-2025-04-14";
 
+/** One content block's direct Files-API requirement. */
+const blockUsesFilesApi = (block: TAnthropicContentBlock): boolean =>
+  ((block.type === "image" || block.type === "document") &&
+    block.source.type === "file") ||
+  block.type === "container_upload";
+
 /**
  * True when any content block references an uploaded file (`source:
  * {type:"file"}` on an image/document, or a `container_upload` block) —
- * Anthropic only honours those under the Files API beta.
+ * Anthropic only honours those under the Files API beta. `tool_result.content`
+ * can contain one nested schema-supported image/document block; inspect that
+ * single level too. (Its nested search_result path is text-only today, so an
+ * arbitrary-depth recursion would be unreachable complexity.)
  */
 const usesFilesApi = (req: TAnthropicRequest): boolean => {
   for (const m of req.messages) {
     if (typeof m.content === "string") continue;
     for (const block of m.content) {
-      if (
-        (block.type === "image" || block.type === "document") &&
-        block.source.type === "file"
-      ) {
-        return true;
+      if (blockUsesFilesApi(block)) return true;
+      if (block.type === "tool_result" && typeof block.content !== "string") {
+        if (block.content.some(blockUsesFilesApi)) return true;
       }
-      if (block.type === "container_upload") return true;
     }
   }
   return false;
