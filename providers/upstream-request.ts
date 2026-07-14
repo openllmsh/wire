@@ -12,7 +12,7 @@ import {
   deriveAnthropicBetaHeader,
 } from "./anthropic/beta-headers";
 import { toAnthropicRequest } from "./anthropic/request";
-import { toChatGptRequest } from "./chatgpt/request";
+import { deriveChatGptSessionId, toChatGptRequest } from "./chatgpt/request";
 
 /**
  * The SINGLE recipe for preparing an upstream provider request from an inbound
@@ -224,17 +224,53 @@ export type TBuildUpstreamRequestInput = {
  */
 export const buildUpstreamHeaders = (
   i: TBuildUpstreamRequestInput,
-): Record<string, string> => ({
-  ...i.baseHeaders,
-  ...wireHeaders(
-    i.surface,
-    i.upstreamWire,
-    i.rawBody,
-    i.inboundBeta ?? null,
-    i.isOAuth ?? false,
-    i.apiVersion,
-  ),
-});
+): Record<string, string> => {
+  const headers: Record<string, string> = {
+    ...i.baseHeaders,
+    ...wireHeaders(
+      i.surface,
+      i.upstreamWire,
+      i.rawBody,
+      i.inboundBeta ?? null,
+      i.isOAuth ?? false,
+      i.apiVersion,
+    ),
+  };
+  if (i.upstreamWire === "chatgpt") {
+    ensureChatGptSessionAffinity(headers, i.surface, i.rawBody);
+  }
+  return headers;
+};
+
+/**
+ * Guarantee a STABLE `session_id` on the ChatGPT Codex wire (chatgpt + grok).
+ * The backend routes prompt-cache affinity by `session_id`; with none, every
+ * request lands on a cold machine and caches nothing (`cached=0`), re-billing
+ * the full conversation input every turn — a subscription drain for agentic
+ * coding (audit 2026-07-14-codex-handrolled-quota-drain). We PRESERVE the
+ * client's own session (a real Codex CLI already sends one, in either
+ * `session_id` or codex-rs `session-id` form) and only SYNTHESIZE a stable
+ * per-conversation one — derived from the immutable conversation prefix — when
+ * the client sent none, so bare clients (chat-completions, custom agents) also
+ * get cache affinity. `x-client-request-id` rides along for vendor-client
+ * parity (caching keys on `session_id`, not this).
+ */
+const ensureChatGptSessionAffinity = (
+  headers: Record<string, string>,
+  surface: TClientSurface,
+  rawBody: unknown,
+): void => {
+  const hasSession = Object.keys(headers).some((k) => {
+    const lk = k.toLowerCase();
+    return lk === "session_id" || lk === "session-id";
+  });
+  if (hasSession) return;
+  const sessionId = deriveChatGptSessionId(
+    canonicalFromInbound(surface, rawBody),
+  );
+  headers.session_id = sessionId;
+  headers["x-client-request-id"] = sessionId;
+};
 
 /**
  * Prepare the `{ body, headers }` for ONE upstream call. The only place the

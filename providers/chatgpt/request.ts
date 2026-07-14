@@ -212,6 +212,29 @@ const extractSystemInstructions = (
   };
 };
 
+/**
+ * Derive a STABLE per-conversation `session_id` for the ChatGPT Codex backend's
+ * prompt-cache affinity. Without a stable `session_id` the backend routes each
+ * request to a cold machine and caches NOTHING — every turn re-bills the full
+ * conversation input at full rate (verified live: `cached=0` without it vs
+ * ~90% with it; audit 2026-07-14-codex-handrolled-quota-drain). Keyed on the
+ * immutable conversation prefix (first user turn + system instructions),
+ * mirroring {@link derivePromptCacheKey}: stable across every turn of one
+ * conversation, distinct across conversations (so traffic doesn't hot-spot one
+ * machine). Independent of the Codex-preamble injection so it doesn't shift
+ * when instructions do.
+ */
+export const deriveChatGptSessionId = (req: TChatCompletionRequest): string => {
+  const { conversation, instructions } = extractSystemInstructions(
+    req.messages,
+  );
+  const firstUser = conversation.find((m) => m.role === "user");
+  const firstUserContent = firstUser !== undefined ? firstUser.content : null;
+  return `openllm-sess-${stableHash(
+    JSON.stringify({ firstUserContent, instructions }),
+  )}`;
+};
+
 const TOOL_RESULT_IMAGE_REPLAY_TEXT = "Attached image(s) from tool result:";
 
 /**
@@ -475,20 +498,18 @@ export const toChatGptRequest = (
     req.messages,
   );
 
-  // The Codex preamble is a Codex IDENTITY required by the ChatGPT backend, but
-  // wrong for other providers on the same Responses wire (xAI Grok). Inject it
-  // only when the caller wants it — `codexInstructions !== false` (undefined =
-  // inject, preserving every existing chatgpt caller). When suppressed, only the
-  // user's OWN system messages (`fromSystem`) ride in `instructions`.
+  // The Codex preamble is a Codex IDENTITY the ChatGPT backend historically
+  // needed. Inject it ONLY when (a) the caller wants it (`codexInstructions !==
+  // false`; `false` suppresses it for xAI Grok) AND (b) the client sent NO
+  // instructions of its own. A real Codex client always sends its own (newer)
+  // preamble — layering ours on top is a DOUBLE preamble that wastes ~2 KB of
+  // input every turn and is unnecessary (current models produce output with no
+  // preamble at all — audit 2026-07-14-codex-upstream-wire §6 F10). So we trust
+  // the client's instructions verbatim and only add ours as a floor for a bare
+  // client. (`includes(...)` still short-circuits an already-Codex preamble.)
   let instructions = fromSystem;
-  if (
-    options.codexInstructions !== false &&
-    !instructions.includes(CHATGPT_DEFAULT_INSTRUCTIONS)
-  ) {
-    instructions =
-      instructions.length > 0
-        ? `${CHATGPT_DEFAULT_INSTRUCTIONS}\n\n${instructions}`
-        : CHATGPT_DEFAULT_INSTRUCTIONS;
+  if (options.codexInstructions !== false && instructions.length === 0) {
+    instructions = CHATGPT_DEFAULT_INSTRUCTIONS;
   }
 
   const input = messagesToInputItems(conversation);
