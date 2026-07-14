@@ -108,7 +108,7 @@ type TResponsesInputItem =
   | {
       readonly type: "function_call_output";
       readonly call_id: string;
-      readonly output: ReadonlyArray<TResponsesContentPart>;
+      readonly output: string;
     }
   | TReasoningResponsesInput;
 
@@ -197,6 +197,66 @@ const extractSystemInstructions = (
   };
 };
 
+const TOOL_RESULT_IMAGE_REPLAY_TEXT = "Attached image(s) from tool result:";
+
+/**
+ * Convert one canonical tool-result message into Responses input items.
+ * `function_call_output.output` is a STRING — the shape Codex itself and
+ * litellm's reference transformation send, and the one field xAI's partner
+ * client (openclaw) force-coerces for Grok before every request (see
+ * docs/audit/2026-07-14-grok-upstream-wire-openclaw-comparison.md §F1).
+ * Non-text parts can't ride in the string: images are replayed as an
+ * IMMEDIATELY-FOLLOWING `user` message (adjacent, not end-of-input, so the
+ * conversation prefix stays byte-stable across turns for prompt caching);
+ * media without a text sibling leaves a placeholder so the model knows the
+ * tool returned something.
+ */
+const toolResultToItems = (
+  msg: Extract<TChatMessage, { readonly role: "tool" }>,
+): TResponsesInputItem[] => {
+  const content = msg.content;
+  const text = extractMessageText(content);
+  const images: TResponsesContentPart[] = [];
+  let hasOtherMedia = false;
+  if (content != null && typeof content !== "string") {
+    for (const block of content) {
+      if (block.type === "image_url") {
+        images.push({
+          type: "input_image",
+          image_url: block.image_url.url,
+          ...(block.image_url.detail !== undefined
+            ? { detail: block.image_url.detail }
+            : {}),
+        });
+      } else if (block.type !== "text") {
+        hasOtherMedia = true;
+      }
+    }
+  }
+  const output =
+    text.trim().length > 0
+      ? text
+      : hasOtherMedia
+        ? "(see attached media)"
+        : images.length > 0
+          ? "(see attached image)"
+          : "";
+  const items: TResponsesInputItem[] = [
+    { type: "function_call_output", call_id: msg.tool_call_id, output },
+  ];
+  if (images.length > 0) {
+    items.push({
+      type: "message",
+      role: "user",
+      content: [
+        { type: "input_text", text: TOOL_RESULT_IMAGE_REPLAY_TEXT },
+        ...images,
+      ],
+    });
+  }
+  return items;
+};
+
 /**
  * Convert the canonical OpenAI ChatCompletion message array into
  * Responses API input items. Mirrors
@@ -207,7 +267,8 @@ const extractSystemInstructions = (
  *   pulled into `instructions` upstream of this call).
  * - `assistant` text content  -> `output_text` parts.
  * - `assistant.tool_calls`    -> one `function_call` item per call.
- * - `tool` (tool result)      -> `function_call_output` with parts.
+ * - `tool` (tool result)      -> `function_call_output` (string) via
+ *   {@link toolResultToItems}, plus an image-replay user message.
  */
 const messagesToInputItems = (
   messages: ReadonlyArray<TChatMessage>,
@@ -223,14 +284,7 @@ const messagesToInputItems = (
       continue;
     }
     if (msg.role === "tool") {
-      items.push({
-        type: "function_call_output",
-        call_id: msg.tool_call_id,
-        // Codex/Responses API expects `output` as a string, not parts.
-        // Coerce parts -> joined text. Mirrors LiteLLM tool message
-        // -> function_call_output convention.
-        output: contentToInputParts(msg.content),
-      });
+      items.push(...toolResultToItems(msg));
       continue;
     }
     if (msg.role === "assistant") {
