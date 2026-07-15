@@ -405,7 +405,11 @@ export const chunkToMessagesEvents = (
         content_block: {
           type: "web_search_tool_result",
           tool_use_id: search.id,
-          content: [],
+          content: (search.results ?? []).map((r) => ({
+            type: "web_search_result",
+            url: r.url,
+            title: r.title ?? r.url,
+          })),
         },
       });
       out.push({ type: "content_block_stop", index: resultIndex });

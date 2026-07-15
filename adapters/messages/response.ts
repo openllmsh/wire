@@ -112,7 +112,11 @@ export const toAnthropicMessagesResponse = (
     content.push({
       type: "web_search_tool_result",
       tool_use_id: search.id,
-      content: [],
+      content: (search.results ?? []).map((r) => ({
+        type: "web_search_result",
+        url: r.url,
+        title: r.title ?? r.url,
+      })),
     });
   }
   // A `thinking` block is emitted ONLY when it carries a replay-safe

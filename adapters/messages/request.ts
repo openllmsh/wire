@@ -205,6 +205,31 @@ const toolResultContentToString = (
 };
 
 /**
+ * Does an inbound Anthropic-wire body declare the `web_search_*` SERVER
+ * tool? The typed descriptor is the client's explicit request for
+ * platform-executed search (Claude Code's WebSearch). Consumers switch a
+ * capable non-Anthropic hop onto its provider-NATIVE search (grok
+ * web/x_search, kimi builtin `$web_search`) — never armed by a bare
+ * `web_search`-NAMED function tool, which stays an ordinary client tool.
+ */
+export const declaresAnthropicServerSearchTool = (
+  rawBody: unknown,
+): boolean => {
+  if (rawBody === null || typeof rawBody !== "object") return false;
+  const tools = (rawBody as { readonly tools?: unknown }).tools;
+  return (
+    Array.isArray(tools) &&
+    tools.some(
+      (tool) =>
+        tool !== null &&
+        typeof tool === "object" &&
+        typeof (tool as { readonly type?: unknown }).type === "string" &&
+        (tool as { readonly type: string }).type.startsWith("web_search_"),
+    )
+  );
+};
+
+/**
  * Default `parameters` schema for Anthropic native server tools that
  * don't carry an `input_schema` of their own (`web_search_*`,
  * `web_fetch_*`, …). Without this, a non-Anthropic provider sees a

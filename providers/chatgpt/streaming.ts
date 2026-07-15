@@ -1,6 +1,7 @@
 import type {
   TChatCompletionChunk,
   TChatGptProviderOptions,
+  TServerSearchCall,
 } from "@quantidexyz/openllmp";
 import {
   buildReasoningItem,
@@ -199,6 +200,71 @@ const isApplyPatchItem = (item: Record<string, unknown>): boolean => {
 const isToolCallItem = (item: Record<string, unknown>): boolean =>
   stringField(item, "type") === "function_call" || isApplyPatchItem(item);
 
+// ─── provider-executed server search items ───────────────────────────
+// Two Responses-wire shapes report a SERVER-side search the provider ran
+// inside the turn (never a client tool call):
+//   - `web_search_call` (OpenAI-native; xAI's grok proxy emits it with the
+//     query AND `action.sources` urls on `output_item.done`), and
+//   - grok's X/Twitter search — `custom_tool_call` items named `x_*`
+//     (`x_semantic_search` / `x_keyword_search`), status "completed", with
+//     the query in the item's JSON `input`. These MUST be recognised before
+//     the apply_patch/custom-tool classification, or they'd leak to the
+//     client as an unexecutable apply_patch tool call.
+// Both map onto the canonical `server_search_calls` carrier, so the client
+// wires re-encode them exactly like Codex hosted search.
+
+const isServerSearchItem = (item: Record<string, unknown>): boolean => {
+  const type = stringField(item, "type");
+  if (type === "web_search_call") return true;
+  return (
+    type === "custom_tool_call" &&
+    (stringField(item, "name") ?? "").startsWith("x_")
+  );
+};
+
+/** Map a COMPLETED server-search output item to its canonical call. */
+const serverSearchOfItem = (
+  item: Record<string, unknown>,
+): TServerSearchCall | null => {
+  if (!isServerSearchItem(item)) return null;
+  const id = stringField(item, "id") ?? stringField(item, "call_id");
+  if (id === undefined) return null;
+  const type = stringField(item, "type");
+  if (type === "web_search_call") {
+    const action = objectField(item, "action");
+    const query =
+      (action !== undefined ? stringField(action, "query") : undefined) ??
+      stringField(item, "query") ??
+      "";
+    const sources = action?.sources;
+    const results = Array.isArray(sources)
+      ? sources.flatMap((s) => {
+          const url =
+            s !== null && typeof s === "object"
+              ? stringField(s as Record<string, unknown>, "url")
+              : undefined;
+          return url !== undefined ? [{ url }] : [];
+        })
+      : [];
+    return {
+      id,
+      query,
+      ...(results.length > 0 ? { results } : {}),
+    };
+  }
+  // x_* custom tool — query rides the JSON `input` string.
+  let query = "";
+  try {
+    const input = JSON.parse(stringField(item, "input") ?? "{}") as {
+      readonly query?: unknown;
+    };
+    if (typeof input.query === "string") query = input.query;
+  } catch {
+    // unparseable input — report the search with an empty query
+  }
+  return { id, query };
+};
+
 const toolCallId = (item: Record<string, unknown>): string | undefined =>
   stringField(item, "call_id") ?? stringField(item, "id");
 
@@ -266,6 +332,26 @@ export const chatGptEventToChunk = (
 
   if (type === "response.output_item.done") {
     const item = objectField(event, "item");
+    // Provider-executed server search completed — surface it on the
+    // canonical carrier BEFORE any tool-call/reasoning handling (an x_*
+    // custom_tool_call would otherwise classify as apply_patch and leak to
+    // the client as an unexecutable tool call). Reasoning drains on the
+    // next event as usual — search items never carry reasoning.
+    if (item !== undefined) {
+      const search = serverSearchOfItem(item);
+      if (search !== null) {
+        return {
+          ...baseChunk(options),
+          choices: [
+            {
+              index: 0,
+              delta: { server_search_calls: [search] },
+              finish_reason: null,
+            },
+          ],
+        };
+      }
+    }
     if (item !== undefined) captureReasoningItem(state, item);
     const drained = drainUnemittedReasoning(state);
     if (drained.length > 0) {
@@ -308,6 +394,9 @@ export const chatGptEventToChunk = (
   if (type === "response.output_item.added") {
     const item = objectField(event, "item");
     if (item === undefined) return null;
+    // A server-search item OPENING is pure lifecycle noise (its query is
+    // still empty) — and it must not open a client tool call.
+    if (isServerSearchItem(item)) return null;
     captureReasoningItem(state, item);
     if (!isToolCallItem(item)) return null;
     state.hasToolCall = true;
@@ -438,6 +527,9 @@ export const chatGptEventToChunk = (
           if (
             item !== null &&
             typeof item === "object" &&
+            // A server-search item (grok x_* custom_tool_call) is NOT a
+            // client tool call — it must not flip the turn to "tool_calls".
+            !isServerSearchItem(item as Record<string, unknown>) &&
             isToolCallItem(item as Record<string, unknown>)
           ) {
             hasToolCall = true;
