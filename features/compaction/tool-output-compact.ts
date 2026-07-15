@@ -1,0 +1,287 @@
+import { estimateBodyTokens } from "../../lib/canonical/token-estimate";
+
+/**
+ * Gateway-side TOOL-OUTPUT compaction — Plan B of the context-overflow
+ * ladder (A: serve correct per-model context metadata so the client
+ * compacts itself; B: THIS — compact tool outputs until the request fits
+ * the target hop's budget; C: walk to a larger-context hop).
+ *
+ * Only tool OUTPUTS are ever rewritten — system/user/assistant text and
+ * the tool-call structure are untouched. Two proven passes:
+ *
+ *   1. Codex's truncation policy (`codex-rs/utils/output-truncation`;
+ *      `truncation_policy: { mode: "tokens", limit: 10000 }` in the
+ *      models manifest): middle-truncate every oversized tool output to
+ *      a per-output token cap — head + tail kept, elision marker in the
+ *      middle, a "Warning: truncated output (original token count: N)"
+ *      header on top.
+ *   2. Claude Code's microcompact: when the per-output cap still doesn't
+ *      fit the budget, CLEAR whole tool outputs oldest-first. The
+ *      trailing round — the results answering the still-pending tool
+ *      calls — is protected: it is only ever middle-truncated, never
+ *      cleared.
+ *
+ * Pure + structural: operates on the parsed inbound body of any surface
+ * (`messages` tool_result blocks, `chat_completions` tool messages,
+ * `responses` function_call_output items), never mutates the input
+ * (compaction rewrites a clone), and never throws on unexpected shapes —
+ * unrecognized structures simply contribute no compactable slots.
+ * Non-text payloads inside a tool output (images, documents, encrypted
+ * content) are preserved verbatim, exactly like codex's own truncation.
+ */
+
+/** Codex's per-tool-output budget (`truncation_policy.limit`). */
+export const PER_TOOL_OUTPUT_TOKEN_CAP = 10_000;
+
+export type TCompactionSurface = "chat_completions" | "messages" | "responses";
+
+export type TToolOutputCompaction = {
+  /** The (possibly rewritten) body — reference-equal to the input when
+   *  nothing changed. */
+  readonly body: unknown;
+  /** `estimateBodyTokens` of the returned body. */
+  readonly estimatedTokens: number;
+  readonly changed: boolean;
+  /** `estimatedTokens <= budgetTokens` — false means even full
+   *  compaction can't fit this hop (the caller falls to Plan C). */
+  readonly fits: boolean;
+};
+
+const approxTokens = (s: string): number => Math.ceil(s.length / 4);
+
+/** Codex-style middle truncation to a token budget: head + tail halves
+ *  around an elision marker, original size in the warning header. */
+const truncateMiddleToTokens = (text: string, budgetTokens: number): string => {
+  const originalTokens = approxTokens(text);
+  // Reserve room for the header + elision marker inside the budget.
+  const keepChars = Math.max(0, budgetTokens * 4 - 200);
+  const head = text.slice(0, Math.ceil(keepChars / 2));
+  const tail = text.slice(text.length - Math.floor(keepChars / 2));
+  const omitted = Math.max(
+    0,
+    originalTokens - approxTokens(head) - approxTokens(tail),
+  );
+  return `Warning: truncated output (original token count: ${originalTokens})\n\n${head}\n…[~${omitted} tokens truncated]…\n${tail}`;
+};
+
+const clearedMarker = (originalTokens: number): string =>
+  `[tool output cleared by the gateway to fit the model's context window — original token count: ${originalTokens}]`;
+
+type TJsonObject = Record<string, unknown>;
+
+const isObj = (v: unknown): v is TJsonObject =>
+  v !== null && typeof v === "object" && !Array.isArray(v);
+
+/** One rewritable tool output. `read` returns only its TEXT payload;
+ *  `write` replaces the text while preserving any non-text blocks. */
+type TSlot = {
+  /** Trailing round (answers to the still-pending tool calls) — never
+   *  cleared, only middle-truncated. */
+  readonly isProtected: boolean;
+  readonly read: () => string;
+  readonly write: (next: string) => void;
+};
+
+const isTextBlock = (b: unknown): b is TJsonObject & { text: string } =>
+  isObj(b) &&
+  typeof b.text === "string" &&
+  (b.type === "text" || b.type === "output_text" || b.type === "input_text");
+
+/** Slot over a `string | block[]` content value living at `holder[key]`.
+ *  Writes collapse the text blocks into one and keep non-text blocks. */
+const contentSlot = (
+  holder: TJsonObject,
+  key: string,
+  isProtected: boolean,
+): TSlot | null => {
+  const value = holder[key];
+  if (typeof value === "string") {
+    return {
+      isProtected,
+      read: () => holder[key] as string,
+      write: (next) => {
+        holder[key] = next;
+      },
+    };
+  }
+  if (Array.isArray(value) && value.some(isTextBlock)) {
+    const blockType = (value.find(isTextBlock) as TJsonObject).type;
+    return {
+      isProtected,
+      read: () =>
+        (holder[key] as unknown[])
+          .filter(isTextBlock)
+          .map((b) => b.text)
+          .join("\n"),
+      write: (next) => {
+        const nonText = (holder[key] as unknown[]).filter(
+          (b) => !isTextBlock(b),
+        );
+        holder[key] = [{ type: blockType, text: next }, ...nonText];
+      },
+    };
+  }
+  return null;
+};
+
+/** Anthropic `messages` surface: `tool_result` blocks inside user turns.
+ *  Protected = blocks after the LAST assistant message (the pending
+ *  round); earlier rounds are already answered by later assistant turns. */
+const messagesSlots = (body: unknown): TSlot[] => {
+  if (!isObj(body) || !Array.isArray(body.messages)) return [];
+  const messages = body.messages;
+  let lastAssistant = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (
+      isObj(messages[i]) &&
+      (messages[i] as TJsonObject).role === "assistant"
+    ) {
+      lastAssistant = i;
+      break;
+    }
+  }
+  const slots: TSlot[] = [];
+  for (const [i, m] of messages.entries()) {
+    if (!isObj(m) || m.role !== "user" || !Array.isArray(m.content)) continue;
+    for (const block of m.content) {
+      if (!isObj(block) || block.type !== "tool_result") continue;
+      const slot = contentSlot(block, "content", i > lastAssistant);
+      if (slot !== null) slots.push(slot);
+    }
+  }
+  return slots;
+};
+
+/** Canonical `chat_completions` surface: `role: "tool"` messages.
+ *  Protected = the trailing contiguous run of tool messages. */
+const chatSlots = (body: unknown): TSlot[] => {
+  if (!isObj(body) || !Array.isArray(body.messages)) return [];
+  const messages = body.messages;
+  let trailingStart = messages.length;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (!isObj(messages[i]) || (messages[i] as TJsonObject).role !== "tool")
+      break;
+    trailingStart = i;
+  }
+  const slots: TSlot[] = [];
+  for (const [i, m] of messages.entries()) {
+    if (!isObj(m) || m.role !== "tool") continue;
+    const slot = contentSlot(m, "content", i >= trailingStart);
+    if (slot !== null) slots.push(slot);
+  }
+  return slots;
+};
+
+/** `responses` surface: `function_call_output` input items.
+ *  Protected = the trailing contiguous run of them. */
+const responsesSlots = (body: unknown): TSlot[] => {
+  if (!isObj(body) || !Array.isArray(body.input)) return [];
+  const input = body.input;
+  let trailingStart = input.length;
+  for (let i = input.length - 1; i >= 0; i--) {
+    if (
+      !isObj(input[i]) ||
+      (input[i] as TJsonObject).type !== "function_call_output"
+    )
+      break;
+    trailingStart = i;
+  }
+  const slots: TSlot[] = [];
+  for (const [i, item] of input.entries()) {
+    if (!isObj(item) || item.type !== "function_call_output") continue;
+    const slot = contentSlot(item, "output", i >= trailingStart);
+    if (slot !== null) slots.push(slot);
+  }
+  return slots;
+};
+
+const collectSlots = (surface: TCompactionSurface, body: unknown): TSlot[] =>
+  surface === "messages"
+    ? messagesSlots(body)
+    : surface === "responses"
+      ? responsesSlots(body)
+      : chatSlots(body);
+
+/**
+ * Rewrite `rawBody`'s tool outputs until its estimate fits
+ * `budgetTokens`. Returns the input untouched when it already fits.
+ */
+export const compactToolOutputsToBudget = (
+  surface: TCompactionSurface,
+  rawBody: unknown,
+  budgetTokens: number,
+): TToolOutputCompaction => {
+  const before = estimateBodyTokens(rawBody);
+  if (before <= budgetTokens) {
+    return {
+      body: rawBody,
+      estimatedTokens: before,
+      changed: false,
+      fits: true,
+    };
+  }
+  const body = structuredClone(rawBody);
+  const slots = collectSlots(surface, body);
+  let estimate = before;
+  let changed = false;
+  // Pass 1 — codex per-output cap, oldest first.
+  for (const slot of slots) {
+    if (estimate <= budgetTokens) break;
+    const text = slot.read();
+    const tokens = approxTokens(text);
+    if (tokens <= PER_TOOL_OUTPUT_TOKEN_CAP) continue;
+    const next = truncateMiddleToTokens(text, PER_TOOL_OUTPUT_TOKEN_CAP);
+    slot.write(next);
+    estimate -= tokens - approxTokens(next);
+    changed = true;
+  }
+  // Pass 2 — clear whole outputs oldest first; the trailing round is
+  // protected (only ever truncated by pass 1).
+  for (const slot of slots) {
+    if (estimate <= budgetTokens) break;
+    if (slot.isProtected) continue;
+    const text = slot.read();
+    const tokens = approxTokens(text);
+    const next = clearedMarker(tokens);
+    if (approxTokens(next) >= tokens) continue;
+    slot.write(next);
+    estimate -= tokens - approxTokens(next);
+    changed = true;
+  }
+  if (!changed) {
+    return {
+      body: rawBody,
+      estimatedTokens: before,
+      changed: false,
+      fits: false,
+    };
+  }
+  const estimatedTokens = estimateBodyTokens(body);
+  return {
+    body,
+    estimatedTokens,
+    changed,
+    fits: estimatedTokens <= budgetTokens,
+  };
+};
+
+/**
+ * The lowest estimate tool-output compaction could reach for this body —
+ * a read-only computation (no clone, no rewrite). The cloud's plan-time
+ * context gate uses it so a hop that compaction could still save is not
+ * pre-dropped: Plan C (dropping/walking) must never preempt Plan B.
+ */
+export const compactionFloorTokens = (
+  surface: TCompactionSurface,
+  rawBody: unknown,
+): number => {
+  let floor = estimateBodyTokens(rawBody);
+  for (const slot of collectSlots(surface, rawBody)) {
+    const tokens = approxTokens(slot.read());
+    const kept = slot.isProtected
+      ? Math.min(tokens, PER_TOOL_OUTPUT_TOKEN_CAP)
+      : Math.min(tokens, approxTokens(clearedMarker(tokens)));
+    floor -= tokens - kept;
+  }
+  return floor;
+};
