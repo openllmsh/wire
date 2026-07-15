@@ -52,6 +52,10 @@ export const responseToChunkStream = (
           ...(typeof message?.reasoning_content === "string"
             ? { reasoning_content: message.reasoning_content }
             : {}),
+          ...(message?.server_search_calls != null &&
+          message.server_search_calls.length > 0
+            ? { server_search_calls: message.server_search_calls }
+            : {}),
         },
         finish_reason: choice?.finish_reason ?? "stop",
       },

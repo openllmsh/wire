@@ -93,6 +93,28 @@ export const toAnthropicMessagesResponse = (
       : null;
 
   const content: TAnthropicContentBlock[] = [];
+  // Provider-executed hosted searches (e.g. Codex hosted web_search on a
+  // chatgpt hop) → the Anthropic wire's server-tool vocabulary, BEFORE the
+  // text that cites them. `server_tool_use.input` carries the real query the
+  // provider searched; the result CONTENT stays provider-internal (Codex
+  // never exposes result items), so the paired `web_search_tool_result` is
+  // an empty result list — honest: the search ran, its findings ride the
+  // grounded answer text. Clients like Claude Code count these blocks (and
+  // `usage.server_tool_use.web_search_requests`) for their "Did N searches".
+  const serverSearches = choice?.message.server_search_calls ?? [];
+  for (const search of serverSearches) {
+    content.push({
+      type: "server_tool_use",
+      id: search.id,
+      name: "web_search",
+      input: { query: search.query },
+    });
+    content.push({
+      type: "web_search_tool_result",
+      tool_use_id: search.id,
+      content: [],
+    });
+  }
   // A `thinking` block is emitted ONLY when it carries a replay-safe
   // `signature` (the Codex/Responses `encrypted_content` round-trip via
   // our `openllm-rs1:` codec). Anthropic hard-rejects a signature-less
@@ -169,6 +191,9 @@ export const toAnthropicMessagesResponse = (
       output_tokens: resp.usage.completion_tokens,
       ...(cached > 0 ? { cache_read_input_tokens: cached } : {}),
       ...(created > 0 ? { cache_creation_input_tokens: created } : {}),
+      ...(serverSearches.length > 0
+        ? { server_tool_use: { web_search_requests: serverSearches.length } }
+        : {}),
     },
   };
 };

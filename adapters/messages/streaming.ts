@@ -87,6 +87,9 @@ export type TMessagesStreamState = {
   pendingReasoningSignature: string | null;
   /** True once `signature_delta` has been emitted (emit exactly once). */
   reasoningSignatureEmitted: boolean;
+  /** Provider-executed hosted searches emitted so far — drives the terminal
+   *  `message_delta.usage.server_tool_use.web_search_requests`. */
+  serverSearchCount: number;
 };
 
 export const newMessagesStreamState = (): TMessagesStreamState => ({
@@ -111,6 +114,7 @@ export const newMessagesStreamState = (): TMessagesStreamState => ({
   thinkingDeltaEmittedLen: 0,
   pendingReasoningSignature: null,
   reasoningSignatureEmitted: false,
+  serverSearchCount: 0,
 });
 
 /**
@@ -359,6 +363,56 @@ export const chunkToMessagesEvents = (
   // tool_use block, so Claude Code replays the `signature` next turn.
   emitReasoningSignature(state, out);
 
+  // Provider-executed hosted searches (Codex `webSearch` items on a chatgpt
+  // hop) → self-contained server_tool_use + web_search_tool_result block
+  // pairs. Blocks must stay strictly sequential, so anything open closes
+  // first; codex interleaves commentary text → search → answer text, and
+  // `openTextBlock` allocates a fresh index for the post-search text. The
+  // result content is an empty list — Codex never exposes result items; the
+  // findings ride the grounded answer text (see the JSON adapter's note).
+  const deltaSearches = choice?.delta.server_search_calls ?? null;
+  if (deltaSearches !== null && deltaSearches !== undefined) {
+    for (const search of deltaSearches) {
+      closeTextBlock(state, out);
+      closeAllToolBlocks(state, out);
+      closeThinkingBlock(state, out);
+      const useIndex = state.nextContentIndex;
+      state.nextContentIndex += 1;
+      out.push({
+        type: "content_block_start",
+        index: useIndex,
+        content_block: {
+          type: "server_tool_use",
+          id: search.id,
+          name: "web_search",
+          input: {},
+        },
+      });
+      out.push({
+        type: "content_block_delta",
+        index: useIndex,
+        delta: {
+          type: "input_json_delta",
+          partial_json: JSON.stringify({ query: search.query }),
+        },
+      });
+      out.push({ type: "content_block_stop", index: useIndex });
+      const resultIndex = state.nextContentIndex;
+      state.nextContentIndex += 1;
+      out.push({
+        type: "content_block_start",
+        index: resultIndex,
+        content_block: {
+          type: "web_search_tool_result",
+          tool_use_id: search.id,
+          content: [],
+        },
+      });
+      out.push({ type: "content_block_stop", index: resultIndex });
+      state.serverSearchCount += 1;
+    }
+  }
+
   // Text delta → open text block (if not already) + content_block_delta.
   if (deltaText !== null && deltaText !== undefined && deltaText.length > 0) {
     const idx = openTextBlock(state, out);
@@ -517,6 +571,13 @@ export const chunkToMessagesEvents = (
           : {}),
         ...(state.cacheReadTokens > 0
           ? { cache_read_input_tokens: state.cacheReadTokens }
+          : {}),
+        ...(state.serverSearchCount > 0
+          ? {
+              server_tool_use: {
+                web_search_requests: state.serverSearchCount,
+              },
+            }
           : {}),
       },
     });

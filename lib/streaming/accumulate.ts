@@ -1,6 +1,7 @@
 import type {
   TChatCompletionChunk,
   TChatCompletionResponse,
+  TServerSearchCall,
   TToolCall,
 } from "@quantidexyz/openllmp";
 
@@ -43,6 +44,9 @@ export const accumulateChunksToResponse = async (
   const toolCalls = new Map<number, TToolCallBuilder>();
   let reasoningContent = "";
   let reasoningItems: ReadonlyArray<unknown> | undefined;
+  // Provider-executed hosted searches (Codex `webSearch` items) — each delta
+  // carries the completed call(s); collect them all for the final message.
+  const serverSearchCalls: TServerSearchCall[] = [];
 
   try {
     for (;;) {
@@ -68,6 +72,12 @@ export const accumulateChunksToResponse = async (
           delta.reasoning_items.length > 0
         ) {
           reasoningItems = delta.reasoning_items;
+        }
+        if (
+          Array.isArray(delta.server_search_calls) &&
+          delta.server_search_calls.length > 0
+        ) {
+          serverSearchCalls.push(...delta.server_search_calls);
         }
         if (Array.isArray(delta.tool_calls)) {
           for (const tc of delta.tool_calls) {
@@ -160,6 +170,9 @@ export const accumulateChunksToResponse = async (
             : {}),
           ...(reasoningItems !== undefined
             ? { reasoning_items: [...reasoningItems] }
+            : {}),
+          ...(serverSearchCalls.length > 0
+            ? { server_search_calls: serverSearchCalls }
             : {}),
         },
         finish_reason: effectiveFinishReason,
