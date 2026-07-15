@@ -320,16 +320,36 @@ const splitAnthropicMessage = (m: TAnthropicMessage): TChatMessage[] => {
   }
 
   if (m.role === "user") {
-    const toolResults = m.content.filter(
-      (b): b is Extract<TAnthropicContentBlock, { type: "tool_result" }> =>
-        b.type === "tool_result",
-    );
-    if (toolResults.length > 0) {
-      return toolResults.map<TChatMessage>((b) => ({
-        role: "tool",
-        content: toolResultContentToString(b.content),
-        tool_call_id: b.tool_use_id,
-      }));
+    if (m.content.some((b) => b.type === "tool_result")) {
+      // A tool_result turn may carry SIBLING blocks — Claude Code delivers
+      // loaded-skill instructions as a text block alongside the Skill
+      // tool_result. Emit a `tool` message per tool_result AND a `user`
+      // message per contiguous run of other blocks, preserving block order;
+      // returning only the tool messages silently severed that injected
+      // context from the conversation on every cross-provider hop.
+      const out: TChatMessage[] = [];
+      let siblings: TAnthropicContentBlock[] = [];
+      const flushSiblings = (): void => {
+        if (siblings.length === 0) return;
+        const content = blocksToCanonicalContent(siblings);
+        siblings = [];
+        if (typeof content === "string" && content.length === 0) return;
+        out.push({ role: "user", content });
+      };
+      for (const b of m.content) {
+        if (b.type === "tool_result") {
+          flushSiblings();
+          out.push({
+            role: "tool",
+            content: toolResultContentToString(b.content),
+            tool_call_id: b.tool_use_id,
+          });
+        } else {
+          siblings.push(b);
+        }
+      }
+      flushSiblings();
+      return out;
     }
     // Preserve image blocks so vision flows through to the chosen
     // upstream provider (works regardless of which provider the user
