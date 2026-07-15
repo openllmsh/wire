@@ -265,6 +265,70 @@ export const compactToolOutputsToBudget = (
   };
 };
 
+/** Compaction targets this fraction of the hop's input budget — the
+ *  chars/4 estimator can UNDER-count real BPE tokens (code runs ~3.2
+ *  chars/token), so landing at 80% keeps the compacted request safely
+ *  inside the window the vendor actually enforces. */
+export const COMPACT_TARGET_FACTOR = 0.8;
+
+/**
+ * Confidence multiplier before a hop is abandoned over context. The
+ * estimator can also OVER-count 30–100% on repetitive content where BPE
+ * compresses heavily, so a hop is only skipped (request-time) or dropped
+ * (plan-time) when the estimate CLEARLY exceeds its limit — borderline
+ * cases go to the real upstream tokenizer, which gets the final word.
+ * Shared by `fitRequestToHopBudget` and the cloud's plan gate
+ * (`dropContextOversizedHops`) so the two thresholds can't drift.
+ */
+export const CONTEXT_SKIP_CONFIDENCE_FACTOR = 1.5;
+
+export type THopContextFit =
+  | {
+      readonly kind: "serve";
+      /** The body to dispatch — reference-equal to the input when no
+       *  compaction was needed. */
+      readonly body: unknown;
+      readonly changed: boolean;
+    }
+  | { readonly kind: "skip" };
+
+/**
+ * The ONE per-hop context-ladder decision, shared verbatim by the cloud
+ * dispatch chain (BYOK) and the daemon walker (device) so the two paths
+ * cannot drift: a request inside the hop's budget serves as-is; over
+ * budget, tool outputs are compacted toward the target (Plan B); the hop
+ * SKIPS — so the chain walks to a larger-context hop (Plan C) — only
+ * when the POST-compaction estimate still clearly exceeds the limit (the
+ * shared 1.5× confidence factor: estimator noise must not abandon a hop
+ * the real tokenizer might accept, the pre-ladder bias preserved). The
+ * FINAL hop never skips — it serves the best-effort compacted body
+ * (never-drop-all). An unknown limit always serves untouched.
+ */
+export const fitRequestToHopBudget = (params: {
+  readonly surface: TCompactionSurface;
+  readonly body: unknown;
+  readonly estimatedTokens: number;
+  readonly inputTokenLimit: number | null;
+  readonly finalHop: boolean;
+}): THopContextFit => {
+  const limit = params.inputTokenLimit;
+  if (limit === null || params.estimatedTokens <= limit) {
+    return { kind: "serve", body: params.body, changed: false };
+  }
+  const compacted = compactToolOutputsToBudget(
+    params.surface,
+    params.body,
+    Math.floor(limit * COMPACT_TARGET_FACTOR),
+  );
+  if (
+    !params.finalHop &&
+    compacted.estimatedTokens > limit * CONTEXT_SKIP_CONFIDENCE_FACTOR
+  ) {
+    return { kind: "skip" };
+  }
+  return { kind: "serve", body: compacted.body, changed: compacted.changed };
+};
+
 /**
  * The lowest estimate tool-output compaction could reach for this body —
  * a read-only computation (no clone, no rewrite). The cloud's plan-time
