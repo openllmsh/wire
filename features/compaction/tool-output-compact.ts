@@ -87,48 +87,37 @@ const isTextBlock = (b: unknown): b is TJsonObject & { text: string } =>
   typeof b.text === "string" &&
   (b.type === "text" || b.type === "output_text" || b.type === "input_text");
 
-/** Slot over a `string | block[]` content value living at `holder[key]`.
- *  Writes collapse the text blocks into one and keep non-text blocks. */
-const contentSlot = (
+/** Slots over a `string | block[]` content value living at `holder[key]` —
+ *  ONE slot per text payload, rewritten IN PLACE. Every block keeps its
+ *  original position, type, and sibling fields: `text/image/text` stays
+ *  `text/image/text` with each caption on its own side of the image, and
+ *  non-text blocks (images, documents, encrypted content) contribute no
+ *  slot and are never touched. */
+const contentSlots = (
   holder: TJsonObject,
   key: string,
   isProtected: boolean,
-): TSlot | null => {
+): TSlot[] => {
   const value = holder[key];
   if (typeof value === "string") {
-    return {
-      isProtected,
-      read: () => holder[key] as string,
-      write: (next) => {
-        holder[key] = next;
+    return [
+      {
+        isProtected,
+        read: () => holder[key] as string,
+        write: (next) => {
+          holder[key] = next;
+        },
       },
-    };
+    ];
   }
-  if (Array.isArray(value) && value.some(isTextBlock)) {
-    return {
-      isProtected,
-      read: () =>
-        (holder[key] as unknown[])
-          .filter(isTextBlock)
-          .map((b) => b.text)
-          .join("\n"),
-      // The FIRST text block takes the compacted text in place (its own
-      // type and any sibling fields preserved); later text blocks drop
-      // (their content is folded into the compacted value); non-text
-      // blocks keep their original positions — an image-first array
-      // stays image-first.
-      write: (next) => {
-        let replaced = false;
-        holder[key] = (holder[key] as unknown[]).flatMap((b) => {
-          if (!isTextBlock(b)) return [b];
-          if (replaced) return [];
-          replaced = true;
-          return [{ ...b, text: next }];
-        });
-      },
-    };
-  }
-  return null;
+  if (!Array.isArray(value)) return [];
+  return value.filter(isTextBlock).map((b) => ({
+    isProtected,
+    read: () => b.text,
+    write: (next) => {
+      (b as TJsonObject).text = next;
+    },
+  }));
 };
 
 /** Anthropic `messages` surface: `tool_result` blocks inside user turns.
@@ -152,8 +141,7 @@ const messagesSlots = (body: unknown): TSlot[] => {
     if (!isObj(m) || m.role !== "user" || !Array.isArray(m.content)) continue;
     for (const block of m.content) {
       if (!isObj(block) || block.type !== "tool_result") continue;
-      const slot = contentSlot(block, "content", i > lastAssistant);
-      if (slot !== null) slots.push(slot);
+      slots.push(...contentSlots(block, "content", i > lastAssistant));
     }
   }
   return slots;
@@ -180,8 +168,7 @@ const chatSlots = (body: unknown): TSlot[] => {
   const slots: TSlot[] = [];
   for (const [i, m] of messages.entries()) {
     if (!isObj(m) || m.role !== "tool") continue;
-    const slot = contentSlot(m, "content", i > lastAssistant);
-    if (slot !== null) slots.push(slot);
+    slots.push(...contentSlots(m, "content", i > lastAssistant));
   }
   return slots;
 };
@@ -208,8 +195,7 @@ const responsesSlots = (body: unknown): TSlot[] => {
   const slots: TSlot[] = [];
   for (const [i, item] of input.entries()) {
     if (!isObj(item) || item.type !== "function_call_output") continue;
-    const slot = contentSlot(item, "output", i > lastModelItem);
-    if (slot !== null) slots.push(slot);
+    slots.push(...contentSlots(item, "output", i > lastModelItem));
   }
   return slots;
 };
