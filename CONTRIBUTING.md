@@ -1,4 +1,4 @@
-# Contributing to `@quantidexyz/openllmw`
+# Contributing to `@openllmsh/wire`
 
 This repository is a **read-only mirror**, regenerated from the OpenLLM
 monorepo on every release. Do not expect merges here to stick — the mirror's
@@ -11,7 +11,7 @@ there, and the next release re-mirrors it back. Your PR is then closed as
 
 ## License of contributions
 
-`openllmw` is **source-available under the Business Source License 1.1**
+`wire` is **source-available under the Business Source License 1.1**
 (BUSL-1.1), with Quantide LLC as the sole commercial Licensor. Because
 inbound=outbound does not hold cleanly for BUSL, contributions require a
 **Contributor License Agreement (CLA)** so Quantide LLC can keep granting

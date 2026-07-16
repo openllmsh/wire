@@ -8,7 +8,7 @@ import type {
   TChatMessage,
   TFilePart,
   TToolCall,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import {
   extractMessageText,
   parseToolArguments,

@@ -1,4 +1,4 @@
-import type { TAnthropicResponse } from "@quantidexyz/openllmp";
+import type { TAnthropicResponse } from "@openllmsh/protocol";
 
 /**
  * Claude Code compaction (`Xm()` in bundled CLI) rejects summaries when the

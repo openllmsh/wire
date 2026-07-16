@@ -4,7 +4,7 @@ import type {
   TAnthropicStreamEvent,
   TChatCompletionChunk,
   TUsage,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import { UpstreamStreamError } from "../../lib/streaming/upstream-error";
 
 const compactionPayloadToText = (raw: unknown): string => {

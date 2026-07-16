@@ -8,9 +8,9 @@
  * `core`'s version takes a whole `TChatProviderSpec`; this takes just the
  * three streaming pieces (`eventSchema` + `initialState` + `eventToChunk`)
  * so it has no dependency on `core`'s spec machinery — only `effect`'s
- * `Schema` (for decode) + `@quantidexyz/openllmp` + the wire SSE primitives.
+ * `Schema` (for decode) + `@openllmsh/protocol` + the wire SSE primitives.
  */
-import type { TChatCompletionChunk } from "@quantidexyz/openllmp";
+import type { TChatCompletionChunk } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import { encodeSseDone, encodeSseEvent, sseEventStream } from "./sse";
 import { upstreamErrorFrom } from "./upstream-error";

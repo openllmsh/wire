@@ -6,7 +6,7 @@ import type {
   TChatCompletionRequest,
   TChatMessage,
   TToolCall,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import type { TCanonicalContentPart } from "../../lib/canonical/content-part";
 import { decodeReasoningSignature } from "./reasoning-signature";
 

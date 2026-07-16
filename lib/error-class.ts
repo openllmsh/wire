@@ -1,8 +1,8 @@
-import type { TErrorEnvelope } from "@quantidexyz/openllmp";
+import type { TErrorEnvelope } from "@openllmsh/protocol";
 
 /**
  * Classifies an uncommitted upstream hop failure. Lives in
- * `@quantidexyz/openllmw` so the cloud orchestrator and coreless daemon walker
+ * `@openllmsh/wire` so the cloud orchestrator and coreless daemon walker
  * share one policy.
  *
  * Once the gateway has validated the inbound request, an upstream rejection

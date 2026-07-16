@@ -1,7 +1,7 @@
 /**
- * `@quantidexyz/openllmw` — pure wire-format transforms shared by the cloud
+ * `@openllmsh/wire` — pure wire-format transforms shared by the cloud
  * pipeline (`@openllm/core`) and the local daemon. Depends only on
- * `@quantidexyz/openllmp`: no Effect-DI, no provider registry, no `fetch`.
+ * `@openllmsh/protocol`: no Effect-DI, no provider registry, no `fetch`.
  *
  * These are the functions a coreless daemon needs to adapt a request
  * to a hop's wire, encode the response back, and synthesize usage —

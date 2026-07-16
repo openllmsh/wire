@@ -9,7 +9,7 @@
  * content type, not "\n" over a request message) — that divergence is
  * intentional and must not be folded in here.
  */
-import type { TChatMessage } from "@quantidexyz/openllmp";
+import type { TChatMessage } from "@openllmsh/protocol";
 
 /**
  * Flatten a canonical message `content` (string | content-part[]) to

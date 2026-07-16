@@ -1,7 +1,7 @@
 import type {
   TChatGptProviderOptions,
   TErrorEnvelope,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 
 // The Codex backend the daemon's delegated bearer token addresses. The
 // OAuth/device-code endpoints + client id are gone — subscription sign-in

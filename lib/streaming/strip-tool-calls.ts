@@ -1,7 +1,7 @@
 import type {
   TChatCompletionChunk,
   TChatCompletionResponse,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 
 /**
  * Claude Code `/compact` uses `Xm()` which requires usable summary text.

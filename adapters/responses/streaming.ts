@@ -1,4 +1,4 @@
-import type { TChatCompletionChunk } from "@quantidexyz/openllmp";
+import type { TChatCompletionChunk } from "@openllmsh/protocol";
 
 /**
  * Outbound adapter (streaming): canonical ChatCompletion chunks → OpenAI

@@ -3,7 +3,7 @@ import type {
   TChatCompletionResponse,
   TServerSearchCall,
   TToolCall,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 
 import { plainTextFromReasoningItems } from "../../adapters/messages/reasoning-from-items";
 

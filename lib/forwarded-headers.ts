@@ -1,7 +1,7 @@
 /**
  * Inbound header allow-list (C1) — the pure policy, shared by the cloud
  * gateway (`@openllm/api`/`@openllm/core`) AND the coreless daemon walker
- * (`@quantidexyz/openllmd`).
+ * (`@openllmsh/daemon`).
  *
  * Every header in this set survives the proxy hop verbatim — the
  * gateway used to silently strip them, breaking SDK ergonomics and

@@ -1,7 +1,7 @@
 import type {
   TAnthropicContentBlock,
   TAnthropicRequest,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 
 /**
  * Anthropic `anthropic-beta` header policy.

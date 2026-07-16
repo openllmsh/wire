@@ -2,7 +2,7 @@ import type {
   TChatCompletionChunk,
   TChatGptProviderOptions,
   TServerSearchCall,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import {
   buildReasoningItem,
   type TReasoningItem,

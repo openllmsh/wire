@@ -2,7 +2,7 @@ import type {
   TAnthropicRequest,
   TChatCompletionRequest,
   TResponsesRequest,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import { fromAnthropicMessagesRequest } from "../adapters/messages/request";
 import { fromResponsesRequest } from "../adapters/responses";
 import { normaliseAdaptiveThinking } from "./anthropic/adaptive-thinking";
@@ -18,9 +18,9 @@ import { deriveChatGptSessionId, toChatGptRequest } from "./chatgpt/request";
  * The SINGLE recipe for preparing an upstream provider request from an inbound
  * one — body + wire-derived headers — for every `(clientWire × upstreamWire)`
  * pairing. The cloud runner (`@openllm/core`) and the coreless daemon walker
- * (`@quantidexyz/openllmd`) BOTH call this; neither re-derives the recipe.
+ * (`@openllmsh/daemon`) BOTH call this; neither re-derives the recipe.
  *
- * This exists because the pure transforms were single-sourced in `@quantidexyz/openllmw`
+ * This exists because the pure transforms were single-sourced in `@openllmsh/wire`
  * but their COMPOSITION was open-coded in core's runner AND the daemon's
  * walker — which can't share (the daemon is core-free) — and drifted, dropping
  * the client's `anthropic-beta` and skipping `normaliseAdaptiveThinking`. See

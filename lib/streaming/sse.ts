@@ -2,7 +2,7 @@ import type {
   TChatCompletionChunk,
   THeartbeatOptions,
   TSseEvent,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 
 const SSE_DONE = "[DONE]";
 

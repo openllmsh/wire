@@ -7,7 +7,7 @@ import type {
   TChatCompletionResponse,
   TToolCall,
   TUsage,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 
 const finishReasonFor = (
   stop: TAnthropicStopReason | null,

@@ -2,7 +2,7 @@ import type {
   TChatCompletionResponse,
   TResponsesOutputItem,
   TResponsesResponse,
-} from "@quantidexyz/openllmp";
+} from "@openllmsh/protocol";
 import { extractMessageText } from "../../lib/canonical/message";
 import {
   reasoningItemsFromUnknown,

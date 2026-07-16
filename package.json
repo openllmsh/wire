@@ -1,5 +1,5 @@
 {
-  "name": "@quantidexyz/openllmw",
+  "name": "@openllmsh/wire",
   "version": "0.0.0",
   "private": false,
   "type": "module",
@@ -12,7 +12,7 @@
     "./*": "./*.ts"
   },
   "dependencies": {
-    "@quantidexyz/openllmp": "workspace:*",
+    "@openllmsh/protocol": "workspace:*",
     "effect": ">=3.20.0"
   },
   "license": "BUSL-1.1"

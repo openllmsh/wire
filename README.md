@@ -5,7 +5,7 @@
   </picture>
 </p>
 
-<p align="center"><b>openllmw</b> — the wire-format engine behind OpenLLM.</p>
+<p align="center"><b>wire</b> — the wire-format engine behind OpenLLM.</p>
 
 <p align="center">
   <a href="./LICENSE"><img alt="License: BUSL-1.1" src="https://img.shields.io/badge/license-BUSL--1.1-blue.svg"></a>
@@ -25,17 +25,17 @@ daemon both run:
 - the single upstream-request builder (model/stream pinning, Anthropic
   adaptive-thinking + `anthropic-beta`)
 
-Depends only on [`@quantidexyz/openllmp`](https://github.com/quantidexyz/openllmp)
+Depends only on [`@openllmsh/protocol`](https://github.com/openllmsh/protocol)
 + `effect`.
 
 ## Install
 
 ```sh
-bun install github:quantidexyz/openllmw # latest
+bun install github:openllmsh/wire # latest
 ```
 
 ```ts
-import { toAnthropicMessagesResponse } from "@quantidexyz/openllmw/adapters/messages/response";
+import { toAnthropicMessagesResponse } from "@openllmsh/wire/adapters/messages/response";
 ```
 
 ## License
