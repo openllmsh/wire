@@ -48,8 +48,7 @@ wire/
     upstream-error.ts                   UpstreamStreamError + upstreamErrorFrom
   features/
     context-skip.ts                     per-hop context-skip gate (shared cloud + daemon)
-  features/compaction/
-    compaction-text.ts                  visible-text compaction-safety helpers
+    compaction/compaction-text.ts       visible-text compaction-safety helpers
 ```
 
 ## Layering rules

@@ -155,6 +155,29 @@ export const fromAnthropicStreamEvent = (
         ],
       };
     }
+    if (event.delta.type === "thinking_delta") {
+      // Extended-thinking deltas ARE live output: map them to canonical
+      // `reasoning_content` (the same field the chatgpt decoder uses) so
+      // (a) cross-wire clients receive the thinking stream instead of
+      // silence, and (b) the pre-commit peek's `isMeaningfulChunk`
+      // commits on the FIRST thinking token — without this, a
+      // thinking-heavy Anthropic stream decoded to nothing until the
+      // first text token and the unbounded peek held the response (and
+      // the passthrough tee buffer) for the entire thinking phase.
+      return {
+        id: state.id ?? "",
+        object: "chat.completion.chunk",
+        created: state.created,
+        model: state.model,
+        choices: [
+          {
+            index: 0,
+            delta: { reasoning_content: event.delta.thinking },
+            finish_reason: null,
+          },
+        ],
+      };
+    }
     if (event.delta.type === "input_json_delta") {
       const toolCallIndex = state.toolCallIndexFor.get(event.index);
       if (toolCallIndex === undefined) return null;
