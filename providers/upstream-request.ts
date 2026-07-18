@@ -56,9 +56,7 @@ const firstBlockIsPreamble = (system: unknown): boolean => {
   if (typeof system === "string") return system === CLAUDE_CODE_SYSTEM_PREAMBLE;
   if (Array.isArray(system)) {
     const first = system[0] as { type?: unknown; text?: unknown } | undefined;
-    return (
-      first?.type === "text" && first.text === CLAUDE_CODE_SYSTEM_PREAMBLE
-    );
+    return first?.type === "text" && first.text === CLAUDE_CODE_SYSTEM_PREAMBLE;
   }
   return false;
 };
