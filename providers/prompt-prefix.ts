@@ -8,14 +8,13 @@ import { CHATGPT_DEFAULT_INSTRUCTIONS } from "./chatgpt/common";
  * this module, so there is a single obvious place to find and change what
  * we prepend to model calls:
  *
- * 1. {@link ensureClaudeCodeSystemPreamble} — the vendor-REQUIRED Claude
- *    Code identity block for the OAuth Anthropic upstream (must be the
- *    FIRST system block or the vendor rejects the call).
- * 2. {@link applyCodexDefaultInstructions} — the Codex identity preamble
+ * 1. {@link applyCodexDefaultInstructions} — the Codex identity preamble
  *    floor for bare clients on the ChatGPT/Codex wire.
- * 3. {@link injectGatewayPromptPrefix} — OUR gateway policy prefix
+ * 2. {@link injectGatewayPromptPrefix} — OUR gateway policy prefix
  *    (`GATEWAY_PROMPT_PREFIX` in `@openllmsh/protocol/prompt-prefix.ts` —
- *    edit the TEXT there), injected into every upstream chat body.
+ *    edit the TEXT there), injected into every upstream chat body EXCEPT
+ *    the genuine Claude Code subscription hop (which is forwarded verbatim
+ *    — see `buildUpstreamBody` in `./upstream-request`).
  *
  * All injections are idempotent. The composition runs at the tail of
  * `buildUpstreamBody` (`./upstream-request`) — the single choke point the
@@ -26,19 +25,18 @@ import { CHATGPT_DEFAULT_INSTRUCTIONS } from "./chatgpt/common";
  *  module imports THIS one). */
 type TWire = "anthropic" | "chatgpt" | "openai";
 
-// ─── 1. Claude Code OAuth preamble (vendor-required) ───────────────────
+// ─── Claude Code OAuth preamble (vendor-required, client-supplied) ─────
 
 /**
  * Anthropic's OAuth (subscription) path GATES inference on the request's FIRST
  * system block being EXACTLY this string — a `text` block, verbatim, in first
- * position (not a prefix of a bigger block, not case-folded, not second). A
- * request that lacks it comes back `429 {type:"rate_limit_error", message:
- * "Error"}` — a spoof-guard masquerading as a rate limit, NOT a real quota hit
- * (confirmed live 2026-07-17 against claude-sonnet-4-5). The genuine Claude
- * Code CLI always sends it, which is why the BRIDGE path works; the HANDROLLED
- * transport forwards the ORIGINATOR's system prompt, so a non-CLI client (or a
- * cross-wire OpenAI client) would omit it. We inject it for the OAuth Anthropic
- * upstream so handrolled reaches the vendor exactly as the bridge does. */
+ * position. A request that lacks it comes back `429 {type:"rate_limit_error",
+ * message:"Error"}` — a spoof-guard masquerading as a rate limit (confirmed
+ * live 2026-07-17 against claude-sonnet-4-5). The genuine Claude Code CLI
+ * ALWAYS sends it; the handrolled OAuth-Anthropic hop only ever serves that
+ * genuine CLI (every other originator takes the bridge), so its request is
+ * forwarded VERBATIM and we no longer synthesise or reorder the preamble.
+ * Kept for `injectAnthropic`'s slotting check on the BYOK path. */
 export const CLAUDE_CODE_SYSTEM_PREAMBLE =
   "You are Claude Code, Anthropic's official CLI for Claude.";
 
@@ -54,53 +52,7 @@ const firstBlockIsPreamble = (system: unknown): boolean => {
   return false;
 };
 
-/** Is this system block the Claude Code preamble, exactly (any position)? */
-const isExactPreambleBlock = (block: unknown): boolean => {
-  const b = block as { type?: unknown; text?: unknown } | undefined;
-  return b?.type === "text" && b.text === CLAUDE_CODE_SYSTEM_PREAMBLE;
-};
-
-/** Normalise a `system` field to a block array (a non-empty string becomes a
- *  single text block; anything else that isn't an array becomes empty). */
-const systemToBlocks = (system: unknown): TSystemBlock[] =>
-  typeof system === "string" && system.length > 0
-    ? [{ type: "text", text: system }]
-    : Array.isArray(system)
-      ? (system as TSystemBlock[])
-      : [];
-
-/**
- * Ensure an Anthropic-wire body's `system` leads with the Claude Code preamble
- * block (see {@link CLAUDE_CODE_SYSTEM_PREAMBLE}) — and with EXACTLY ONE copy.
- *
- * The vendor gates OAuth inference on the preamble being the FIRST system
- * block. A real Claude Code client already sends it first, but the block it
- * leads with is not always at index 0 of the RAW inbound `system` (a client or
- * an intermediary can prepend another block — e.g. a stray header-shaped text
- * block — pushing the genuine preamble to index 1). Naively prepending a fresh
- * preamble then produces a DUPLICATE preamble with foreign content wedged
- * between the two copies. So instead of a first-block-only check we:
- *   - find every exact preamble block, preserve ONE (keeping its metadata, e.g.
- *     `cache_control`) and move it to index 0,
- *   - drop the duplicate exact copies,
- *   - preserve every other block and their relative order,
- *   - inject a fresh preamble only when none exists.
- * Idempotent: a body already leading with a single preamble is unchanged.
- */
-export const ensureClaudeCodeSystemPreamble = (body: unknown): unknown => {
-  if (typeof body !== "object" || body === null) return body;
-  const record = body as Record<string, unknown>;
-  const blocks = systemToBlocks(record.system);
-  const existingPreamble = blocks.find(isExactPreambleBlock);
-  const rest = blocks.filter((b) => !isExactPreambleBlock(b));
-  const lead: TSystemBlock = existingPreamble ?? {
-    type: "text",
-    text: CLAUDE_CODE_SYSTEM_PREAMBLE,
-  };
-  return { ...record, system: [lead, ...rest] };
-};
-
-// ─── 2. Codex default-instructions floor ───────────────────────────────
+// ─── Codex default-instructions floor ──────────────────────────────────
 
 /**
  * The Codex preamble is a Codex IDENTITY the ChatGPT backend historically
