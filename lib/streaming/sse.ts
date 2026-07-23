@@ -237,28 +237,43 @@ export const withFrameAlignedHeartbeat = (
       timer = setInterval(() => safeEnqueue(beat()), options.intervalMs);
     },
     async pull(controller) {
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) {
-          // Flush any unterminated trailing bytes verbatim so an
-          // upstream that ends mid-frame loses nothing.
-          if (buffer.length > 0) {
-            controller.enqueue(textEncoder.encode(buffer));
-            buffer = "";
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) {
+            // Flush any unterminated trailing bytes verbatim so an
+            // upstream that ends mid-frame loses nothing.
+            if (buffer.length > 0) {
+              controller.enqueue(textEncoder.encode(buffer));
+              buffer = "";
+            }
+            closed = true;
+            clear();
+            controller.close();
+            return;
           }
-          closed = true;
-          clear();
-          controller.close();
+          buffer += textDecoder.decode(value, { stream: true });
+          const { events, rest } = splitLines(buffer);
+          buffer = rest;
+          if (events.length === 0) continue;
+          for (const e of events) {
+            controller.enqueue(textEncoder.encode(`${e}\n\n`));
+          }
           return;
         }
-        buffer += textDecoder.decode(value, { stream: true });
-        const { events, rest } = splitLines(buffer);
-        buffer = rest;
-        if (events.length === 0) continue;
-        for (const e of events) {
-          controller.enqueue(textEncoder.encode(`${e}\n\n`));
-        }
-        return;
+      } catch {
+        // Raw passthrough has no canonical encoder to translate a rejected
+        // reader. Emit Anthropic's native terminal envelope rather than severing
+        // the socket; never expose the thrown message because fetch errors often
+        // contain credential-bearing upstream URLs.
+        closed = true;
+        clear();
+        controller.enqueue(
+          textEncoder.encode(
+            'event: error\ndata: {"type":"error","error":{"type":"stream_error","message":"upstream stream failed"}}\n\n',
+          ),
+        );
+        controller.close();
       }
     },
     cancel(reason) {
