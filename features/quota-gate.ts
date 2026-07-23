@@ -16,6 +16,21 @@ type TQuotaPool = Extract<
   { readonly kind: "quota" }
 >["windows"][number];
 
+/**
+ * May a STALE snapshot's exhausted `pool` still gate routing?
+ *
+ * A pool whose reset instant is KNOWN and still ahead is self-validating: the
+ * window cannot have refilled before it resets, so the read's age is
+ * irrelevant — it gates until that instant, then stops. Age-capping this case
+ * made the gate useless for precisely the provider that needs it: an exhausted
+ * account serves no successful request, so nothing re-samples its usage, so its
+ * snapshot sits permanently past the cap and the dead hop is dialled on every
+ * request (grok weekly at 100% with a 6-day-out reset, read 20 min earlier →
+ * dialled → HTTP 402 "usage balance exhausted").
+ *
+ * With NO reset instant there is nothing to validate against, so the freshness
+ * cap remains the only evidence and an aged read is not trusted.
+ */
 const stalePoolIsGateable = (
   snapshot: Extract<TProviderUsageSnapshot, { readonly kind: "quota" }>,
   pool: TQuotaPool | undefined,
@@ -23,13 +38,11 @@ const stalePoolIsGateable = (
   now: number,
 ): boolean => {
   if (!snapshot.stale) return true;
-  if (snapshot.as_of_ms === undefined || now - snapshot.as_of_ms > staleCapMs) {
-    return false;
+  if (pool?.reset_at_ms !== null && pool?.reset_at_ms !== undefined) {
+    return now < pool.reset_at_ms;
   }
   return (
-    pool?.reset_at_ms === null ||
-    pool?.reset_at_ms === undefined ||
-    now < pool.reset_at_ms
+    snapshot.as_of_ms !== undefined && now - snapshot.as_of_ms <= staleCapMs
   );
 };
 
