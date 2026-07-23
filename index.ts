@@ -15,6 +15,7 @@ export * from "./adapters/messages/streaming";
 export * from "./features/compaction/compaction-text";
 export * from "./features/context-demote";
 export * from "./features/context-skip";
+export * from "./features/quota-gate";
 export * from "./lib/canonical/message";
 export * from "./lib/canonical/token-estimate";
 export * from "./lib/encrypted-content";
