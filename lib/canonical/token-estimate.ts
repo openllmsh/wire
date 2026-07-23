@@ -30,6 +30,24 @@
  * an extra chain step than ship an oversized request that 400s.
  */
 
+import type { TTokenEncoding } from "./encoding-select";
+import { DEFAULT_ENCODING, peekTokenCounter } from "./encoding-select";
+
+/**
+ * Count a single string as tokens for `encoding`, using the real BPE ruler when
+ * that family's tokenizer is already warm on this isolate, and falling back to
+ * the `chars/4` heuristic when it isn't. The synchronous fallback is what lets
+ * every caller stay synchronous; warm the ruler at request entry
+ * (`getTokenCounter`) to make the accurate path the common one. `max(1, …)` so
+ * any non-empty text counts as at least one token.
+ */
+const rulerTokens = (text: string, encoding: TTokenEncoding): number => {
+  if (text.length === 0) return 0;
+  const counter = peekTokenCounter(encoding);
+  if (counter !== null) return Math.max(1, counter.count(text));
+  return Math.max(1, Math.ceil(text.length / 4));
+};
+
 const stringCharsFromAny = (v: unknown): number => {
   if (typeof v === "string") return v.length;
   if (Array.isArray(v)) {
@@ -47,14 +65,43 @@ const stringCharsFromAny = (v: unknown): number => {
   return 0;
 };
 
-export const estimateBodyTokens = (body: unknown): number =>
-  Math.ceil(stringCharsFromAny(body) / 4);
+/**
+ * Collect every string in a JSON value, joined by "\n" (a token boundary the
+ * BPE won't merge across), so the ruler counts them as one pass instead of
+ * summing chars. Mirrors {@link stringCharsFromAny}'s walk exactly.
+ */
+const collectStrings = (v: unknown, out: string[]): void => {
+  if (typeof v === "string") {
+    out.push(v);
+    return;
+  }
+  if (Array.isArray(v)) {
+    for (const x of v) collectStrings(x, out);
+    return;
+  }
+  if (v !== null && typeof v === "object") {
+    for (const k of Object.keys(v as Record<string, unknown>)) {
+      collectStrings((v as Record<string, unknown>)[k], out);
+    }
+  }
+};
 
-// ~4 chars per token — within ~15% for English prose, which is all a preflight
-// needs (model-availability check + a context-window indicator). `max(1, …)`
-// so any non-empty text counts as at least one token.
-const textTokens = (text: string): number =>
-  text.length === 0 ? 0 : Math.max(1, Math.ceil(text.length / 4));
+export const estimateBodyTokens = (
+  body: unknown,
+  encoding: TTokenEncoding = DEFAULT_ENCODING,
+): number => {
+  if (peekTokenCounter(encoding) === null) {
+    // Cold isolate — keep the exact historical `chars/4`-over-total behaviour.
+    return Math.ceil(stringCharsFromAny(body) / 4);
+  }
+  const parts: string[] = [];
+  collectStrings(body, parts);
+  return rulerTokens(parts.join("\n"), encoding);
+};
+
+// The real BPE ruler when warm, `chars/4` when cold — see {@link rulerTokens}.
+const textTokens = (text: string, encoding: TTokenEncoding): number =>
+  rulerTokens(text, encoding);
 
 /**
  * The text an Anthropic content value actually puts in front of the model:
@@ -110,24 +157,28 @@ const anthropicContentText = (content: unknown): string => {
  */
 export const estimateAnthropicInputTokens = (body: unknown): number => {
   if (body === null || typeof body !== "object") return 0;
+  // This body is Anthropic-shaped by definition, so the Claude ruler is the
+  // right one when it's warm; cold, `textTokens` falls back to `chars/4`.
+  const enc: TTokenEncoding = "claude";
   const b = body as Record<string, unknown>;
   let total = 0;
   const system = b.system;
-  if (typeof system === "string") total += textTokens(system);
+  if (typeof system === "string") total += textTokens(system, enc);
   else if (Array.isArray(system)) {
-    total += textTokens(anthropicContentText(system));
+    total += textTokens(anthropicContentText(system), enc);
   }
   if (Array.isArray(b.messages)) {
     for (const m of b.messages) {
       if (m === null || typeof m !== "object") continue;
       total += textTokens(
         anthropicContentText((m as Record<string, unknown>).content),
+        enc,
       );
     }
   }
   // Tool schemas are billed as input too, and they are not small.
   if (Array.isArray(b.tools) && b.tools.length > 0) {
-    total += textTokens(JSON.stringify(b.tools));
+    total += textTokens(JSON.stringify(b.tools), enc);
   }
   return total;
 };
