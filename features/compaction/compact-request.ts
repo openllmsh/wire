@@ -186,6 +186,52 @@ const truncateCanonicalToolOutputs = (
     return msg;
   });
 
+// ─── Responses (ChatGPT / Codex) truncation ───────────────────────────────
+//
+// A Responses body is `{ input: string | item[] }` — NOT a `messages` array.
+// Items are `message` (role + `input_text`/`output_text`/image/file parts),
+// `function_call` (`call_id`, `arguments`), `function_call_output` (`call_id`,
+// bulky `output`), and `reasoning`. Tool pairing is `function_call.call_id` ↔
+// `function_call_output.call_id`, as SEPARATE top-level items. There is no
+// per-item `cache_control` (Responses caches via the top-level
+// `prompt_cache_key`, which compaction never touches).
+
+/**
+ * Truncate the `output` of every `function_call_output` item to `maxChars`,
+ * oldest→newest, skipping the last user turn. `output` is `string | part[]`;
+ * string truncates directly, part-array truncates `input_text`/`output_text`
+ * parts in place.
+ */
+const truncateResponsesToolOutputs = (
+  input: ReadonlyArray<unknown>,
+  maxChars: number,
+  lastUserIndex: number,
+): unknown[] =>
+  input.map((item, i) => {
+    if (
+      i === lastUserIndex ||
+      !isRecord(item) ||
+      item.type !== "function_call_output"
+    ) {
+      return item;
+    }
+    const output = item.output;
+    if (typeof output === "string") {
+      return { ...item, output: truncateMiddleToChars(output, maxChars) };
+    }
+    if (Array.isArray(output)) {
+      const next = output.map((part) =>
+        isRecord(part) &&
+        (part.type === "input_text" || part.type === "output_text") &&
+        typeof part.text === "string"
+          ? { ...part, text: truncateMiddleToChars(part.text, maxChars) }
+          : part,
+      );
+      return { ...item, output: next };
+    }
+    return item;
+  });
+
 // ─── Turn dropping (with pairing + cache preservation) ─────────────────────
 
 /**
@@ -355,6 +401,89 @@ const dropOldestTurns = (
   return survivors;
 };
 
+/** The index of the last Responses `message` item with `role:"user"`. */
+const lastResponsesUserIndex = (input: ReadonlyArray<unknown>): number =>
+  input.reduceRight<number>(
+    (acc, item, idx) =>
+      acc === -1 &&
+      isRecord(item) &&
+      item.type === "message" &&
+      item.role === "user"
+        ? idx
+        : acc,
+    -1,
+  );
+
+/**
+ * Drop the oldest droppable Responses `input` items until the body fits or
+ * nothing more can go. Preserves the last user `message` (the live query) and
+ * `function_call` ↔ `function_call_output` pairing (dropping a `function_call`
+ * takes its matching `function_call_output` with it, and vice-versa), so the
+ * upstream never sees an orphaned call or output. Leading `message` items with
+ * `role:"system"`/`"developer"` (the instructions prefix) are never dropped.
+ */
+const dropOldestResponsesItems = (
+  input: ReadonlyArray<unknown>,
+  fits: (items: ReadonlyArray<unknown>) => boolean,
+): unknown[] => {
+  const survivors = [...input];
+  // Skip a leading system/developer instructions prefix.
+  let start = 0;
+  while (start < survivors.length) {
+    const it = survivors[start];
+    if (
+      isRecord(it) &&
+      it.type === "message" &&
+      (it.role === "system" || it.role === "developer")
+    ) {
+      start++;
+      continue;
+    }
+    break;
+  }
+  let i = start;
+  while (i < survivors.length) {
+    if (fits(survivors)) break;
+    const lastUser = lastResponsesUserIndex(survivors);
+    if (i >= lastUser) break;
+    const item = survivors[i];
+    if (
+      isRecord(item) &&
+      item.type === "message" &&
+      (item.role === "system" || item.role === "developer")
+    ) {
+      i++;
+      continue;
+    }
+    // Dropping a function_call / function_call_output must take its pair too.
+    if (
+      isRecord(item) &&
+      (item.type === "function_call" || item.type === "function_call_output") &&
+      typeof item.call_id === "string"
+    ) {
+      const callId = item.call_id;
+      survivors.splice(i, 1);
+      for (let j = 0; j < survivors.length; ) {
+        const other = survivors[j];
+        if (
+          isRecord(other) &&
+          (other.type === "function_call" ||
+            other.type === "function_call_output") &&
+          other.call_id === callId
+        ) {
+          survivors.splice(j, 1);
+          if (j < i) i--; // a removal before the cursor shifts it left
+        } else {
+          j++;
+        }
+      }
+      continue;
+    }
+    survivors.splice(i, 1);
+  }
+  return survivors;
+};
+
 // ─── The public entry point ────────────────────────────────────────────────
 
 /** Char budget per tool output at each truncation pass, tightening each round. */
@@ -391,8 +520,19 @@ export const compactRequestToFit = (
   if (initial <= targetTokens) {
     return { body, compacted: true, estimatedTokens: initial };
   }
-  if (!isRecord(body) || !Array.isArray(body.messages)) {
-    // Nothing structured to shrink.
+  if (!isRecord(body)) {
+    return { body, compacted: false, estimatedTokens: initial };
+  }
+
+  // Responses (ChatGPT / Codex): shape is `{ input: item[] }`, handled by its
+  // own item-walk rather than the `messages`-array path.
+  if (surface === "responses" && Array.isArray(body.input)) {
+    return compactResponsesBody(body, body.input, targetTokens, estimate);
+  }
+
+  if (!Array.isArray(body.messages)) {
+    // Nothing structured to shrink (e.g. a bare-string Responses `input`, or an
+    // unrecognised body).
     return { body, compacted: false, estimatedTokens: initial };
   }
 
@@ -427,6 +567,46 @@ export const compactRequestToFit = (
   );
 
   const finalBody = withMessages(messages);
+  const finalEst = estimate(finalBody);
+  return {
+    body: finalBody,
+    compacted: finalEst <= targetTokens,
+    estimatedTokens: finalEst,
+  };
+};
+
+/**
+ * The `responses`-surface arm of {@link compactRequestToFit}: same two-pass
+ * ladder (truncate `function_call_output`s → drop oldest items) over the
+ * Responses `input[]` array, preserving the last user message and
+ * function_call ↔ function_call_output pairing.
+ */
+const compactResponsesBody = (
+  body: TRecord,
+  inputItems: ReadonlyArray<unknown>,
+  targetTokens: number,
+  estimate: (b: unknown) => number,
+): TCompactionResult => {
+  let input: unknown[] = [...inputItems];
+  const withInput = (items: unknown[]): TRecord => ({ ...body, input: items });
+
+  // Pass 1: truncate tool outputs, tightening the cap each round.
+  for (const cap of TRUNCATION_PASSES) {
+    const lastUser = lastResponsesUserIndex(input);
+    input = truncateResponsesToolOutputs(input, cap, lastUser);
+    const est = estimate(withInput(input));
+    if (est <= targetTokens) {
+      return { body: withInput(input), compacted: true, estimatedTokens: est };
+    }
+  }
+
+  // Pass 2: drop oldest droppable items (pairing preserved).
+  input = dropOldestResponsesItems(
+    input,
+    (items) => estimate(withInput([...items])) <= targetTokens,
+  );
+
+  const finalBody = withInput(input);
   const finalEst = estimate(finalBody);
   return {
     body: finalBody,
