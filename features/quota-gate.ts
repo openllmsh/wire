@@ -58,22 +58,16 @@ export const quotaGateDecision = (params: {
   }
 
   const { snapshot } = params;
-  const staleProviderRejectedPastReset =
-    snapshot.stale &&
-    snapshot.windows.some(
-      (window) =>
-        window.reset_at_ms !== null && params.now >= window.reset_at_ms,
-    );
-  if (
-    snapshot.status === "rejected" &&
-    !staleProviderRejectedPastReset &&
-    stalePoolIsGateable(
-      snapshot,
-      snapshot.windows.find((window) => window.percent_used >= 100),
-      params.staleCapMs,
-      params.now,
-    )
-  ) {
+  // A rejected quota snapshot derives from exhausted shared provider windows.
+  // For fresh snapshots that vendor verdict is current. For stale snapshots,
+  // assess EACH exhausted window independently: an old 5-hour window that has
+  // reset cannot erase the still-future 7-day exhaustion in the same snapshot.
+  const exhaustedProviderWindow = snapshot.windows.find(
+    (window) =>
+      window.percent_used >= 100 &&
+      stalePoolIsGateable(snapshot, window, params.staleCapMs, params.now),
+  );
+  if (snapshot.status === "rejected" && exhaustedProviderWindow !== undefined) {
     return { kind: "skip", reason: "quota_skip: provider window exhausted" };
   }
 

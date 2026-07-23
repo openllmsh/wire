@@ -14,6 +14,11 @@ import type { TCooldownReason, TErrorEnvelope } from "@openllmsh/protocol";
  * A committed response never reaches this classifier. After output has been
  * committed, the serving transport owns any failure and cannot restart on a
  * different model safely.
+ *
+ * Some Envoy edge-connect failures wear a 5xx status despite describing a
+ * network failure between the edge and its upstream. The narrow conjunction
+ * below keeps those failures from cooling a model, while ordinary vendor 5xx
+ * responses remain `server_error` and retain their cooldown.
  */
 export type TFallbackClass =
   | { readonly kind: "transient"; readonly reason: TCooldownReason }
@@ -30,6 +35,16 @@ const QUOTA_BODY =
   /usage limit|usage balance|balance exhausted|quota|billing cycle|upgrade your plan|out of credits|purchase extra usage|insufficient_quota/i;
 const CONTEXT_OVERFLOW_BODY =
   /maximum (prompt|context) length|exceeds the context window|too many tokens|maximum context length|reduce the length of the messages/i;
+// Envoy's first sentence is version-invariant; the trailing reset-reason
+// clause drifts between Envoy versions ("reset reason: …" vs "retried and the
+// latest reset reason: …"), so the matcher pins only the first sentence.
+const ENVOY_CONNECT_ERROR_BODY = [
+  /upstream connect error/i,
+  /disconnect\/reset before headers/i,
+] as const;
+
+const isEnvoyConnectError = (message: string): boolean =>
+  ENVOY_CONNECT_ERROR_BODY.every((pattern) => pattern.test(message));
 
 const reasonForStatus = (i: TClassifierInput): TCooldownReason => {
   if (i.envelope?.error?.code === "content_filter") return "content_filter";
@@ -40,7 +55,9 @@ const reasonForStatus = (i: TClassifierInput): TCooldownReason => {
   if (i.status === 429) {
     return QUOTA_BODY.test(message) ? "quota_exhausted" : "rate_limit";
   }
-  if (i.status >= 500) return "server_error";
+  if (i.status >= 500) {
+    return isEnvoyConnectError(message) ? "network" : "server_error";
+  }
   if (i.status === 401 || i.status === 403 || i.status === 407) {
     return QUOTA_BODY.test(message) ? "quota_exhausted" : "auth";
   }
