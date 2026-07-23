@@ -63,6 +63,60 @@ export const canonicalFromInbound = (
  * Exported because the daemon's web_search agentic loop rebuilds the upstream
  * body each round from an ALREADY-canonical request (not the inbound body).
  */
+const inlineAnthropicSystemContent = (content: unknown): unknown[] =>
+  typeof content === "string"
+    ? [{ type: "text", text: content }]
+    : Array.isArray(content)
+      ? content
+      : [];
+
+/**
+ * Claude Code can emit mid-conversation `role: "system"` messages, but only
+ * models that opt into that extension accept them. Same-wire passthrough must
+ * therefore hoist them into the universally accepted top-level `system` field
+ * before selecting an upstream model such as Haiku. Keep content blocks
+ * verbatim: unlike the cross-wire encoder's text-only canonical system form,
+ * this operates on an already Anthropic-shaped request.
+ */
+const hoistInlineAnthropicSystemMessages = (
+  body: Record<string, unknown>,
+): Record<string, unknown> => {
+  if (!Array.isArray(body.messages)) return body;
+
+  const inlineSystemMessages = body.messages.filter(
+    (message) =>
+      typeof message === "object" &&
+      message !== null &&
+      (message as { readonly role?: unknown }).role === "system",
+  );
+  if (inlineSystemMessages.length === 0) return body;
+
+  const existingSystem =
+    typeof body.system === "string"
+      ? [{ type: "text", text: body.system }]
+      : Array.isArray(body.system)
+        ? body.system
+        : [];
+  const hoistedSystem = inlineSystemMessages.flatMap((message) =>
+    inlineAnthropicSystemContent(
+      (message as { readonly content?: unknown }).content,
+    ),
+  );
+
+  return {
+    ...body,
+    system: [...existingSystem, ...hoistedSystem],
+    messages: body.messages.filter(
+      (message) =>
+        !(
+          typeof message === "object" &&
+          message !== null &&
+          (message as { readonly role?: unknown }).role === "system"
+        ),
+    ),
+  };
+};
+
 export const canonicalToUpstreamBody = (
   upstreamWire: TUpstreamWire,
   canonical: TChatCompletionRequest,
@@ -165,7 +219,9 @@ export const buildUpstreamBody = (
       ...(stream !== undefined ? { stream } : {}),
     };
     return withClaudePreamble(
-      upstreamWire === "anthropic" ? normaliseAdaptiveThinking(pinned) : pinned,
+      upstreamWire === "anthropic"
+        ? normaliseAdaptiveThinking(hoistInlineAnthropicSystemMessages(pinned))
+        : pinned,
     );
   }
   // Cross-wire: route through canonical, then encode to the upstream's wire.

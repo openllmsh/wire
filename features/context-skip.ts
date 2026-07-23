@@ -26,25 +26,23 @@
 
 /**
  * Confidence multiplier before a hop is abandoned over context. The
- * chars/4 estimator can over-count 30–100% on repetitive content where
- * BPE compresses heavily, so a hop is only skipped (request-time) or
- * dropped (plan-time) when the estimate CLEARLY exceeds its limit —
- * borderline cases go to the real upstream tokenizer, which gets the
- * final word via the pre-commit peek walk.
+ * routing estimator is intentionally conservative (it counts every string
+ * value), so an estimate above the catalogued input budget is enough to skip
+ * a non-final hop: that model has already advertised it cannot accept the
+ * request. Final and unknown-limit hops still reach the real tokenizer.
  *
- * Bias note: false negatives (under-skip) degrade to "request hits
- * upstream → rejection → peek walks the chain" — a wasted round trip,
- * nothing more. False positives (over-skip) could strand a request on a
- * worse hop, so we err conservative.
+ * A factor above 1 let known-over-budget requests through to an inevitable
+ * upstream context rejection. Keep this at one unless the estimator contract
+ * itself changes.
  */
-export const CONTEXT_SKIP_CONFIDENCE_FACTOR = 1.5;
+export const CONTEXT_SKIP_CONFIDENCE_FACTOR = 1;
 
 /**
  * Should this hop be skipped for context? True only when a later hop
  * remains (the FINAL hop always serves — the real tokenizer must get the
  * last word, never the heuristic estimator), the model's input budget is
- * known, and the estimate clearly exceeds it (the shared confidence
- * factor). An unknown limit always serves.
+ * known, and the conservative routing estimate exceeds it. An unknown
+ * limit always serves.
  */
 export const shouldSkipHopForContext = (params: {
   readonly estimatedTokens: number;
