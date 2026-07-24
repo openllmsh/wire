@@ -48,8 +48,10 @@ export const truncateMiddleToChars = (
   if (text.length <= cap) return text;
   const budget = cap - ELISION.length;
   if (budget <= COMPACTION_MIN_VISIBLE_TEXT_CHARS) {
-    // No room for both ends around the marker — keep a short head only.
-    return text.slice(0, cap - ELISION.length > 0 ? cap - ELISION.length : cap);
+    // No room for both ends around the marker — keep a short head only, up to
+    // the (floor-widened) cap. `cap` is already >= COMPACTION_MIN_VISIBLE_TEXT_CHARS,
+    // so this never drops below the documented visible-text floor.
+    return text.slice(0, cap);
   }
   const headLen = Math.ceil((budget * 2) / 3);
   const tailLen = budget - headLen;
