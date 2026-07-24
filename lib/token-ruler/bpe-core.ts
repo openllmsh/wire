@@ -179,8 +179,12 @@ export class BpeCounter {
         tokensCount += cached;
         continue;
       }
-      const merged = this.bytePairMergeCount(textEncoder.encode(match));
-      if (match.length <= MERGE_COUNT_CACHE_MAX_PIECE) {
+      const encoded = textEncoder.encode(match);
+      const merged = this.bytePairMergeCount(encoded);
+      // Guard on the ENCODED byte length: that is what drives both the merge
+      // cost and the retained memory. `match.length` is UTF-16 code units, which
+      // understates multi-byte text by up to 4x (CJK, emoji).
+      if (encoded.length <= MERGE_COUNT_CACHE_MAX_PIECE) {
         if (this.mergeCountCache.size >= MERGE_COUNT_CACHE_MAX) {
           this.mergeCountCache.clear();
         }
