@@ -19,14 +19,27 @@ export const nextLargerContextModel = (
 };
 
 /**
- * Extract the upstream tokenizer's authoritative request size from the common
- * "maximum prompt length is N ... contains M tokens" overflow diagnostic.
+ * Extract the upstream tokenizer's authoritative request size from an overflow
+ * diagnostic. Recognises the three vendor shapes observed live:
+ *   - vLLM-style:   "maximum prompt length is N ... contains M tokens" → M
+ *   - Anthropic:    "prompt is too long: N tokens > M maximum" → N
+ *   - Kimi/DeepSeek:"... token limit: X (requested: N)" → N
+ * Returns the REQUIRED size (how big the request actually is), not the window.
  */
 export const contextOverflowRequiredTokens = (raw: string): number | null => {
-  const match = /maximum (?:prompt|context) length is\s+([\d,]+).*?contains\s+([\d,]+)\s+tokens/i.exec(
-    raw,
-  );
-  if (match === null) return null;
-  const required = Number((match[2] ?? "").replaceAll(",", ""));
-  return Number.isSafeInteger(required) && required > 0 ? required : null;
+  const patterns = [
+    // vLLM-style: the "contains M tokens" count.
+    /maximum (?:prompt|context) length is\s+[\d,]+.*?contains\s+([\d,]+)\s+tokens/i,
+    // Anthropic: "prompt is too long: N tokens > M maximum".
+    /prompt is too long:\s*([\d,]+)\s*tokens/i,
+    // Kimi/DeepSeek: "token limit: X (requested: N)".
+    /\(requested:\s*([\d,]+)\)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(raw);
+    if (match === null) continue;
+    const required = Number((match[1] ?? "").replaceAll(",", ""));
+    if (Number.isSafeInteger(required) && required > 0) return required;
+  }
+  return null;
 };
