@@ -33,8 +33,14 @@ export type TClassifierInput = {
 
 const QUOTA_BODY =
   /usage limit|usage balance|balance exhausted|quota|billing cycle|upgrade your plan|out of credits|purchase extra usage|insufficient_quota/i;
-const CONTEXT_OVERFLOW_BODY =
-  /maximum (prompt|context) length|exceeds the context window|too many tokens|maximum context length|reduce the length of the messages/i;
+/**
+ * The vendor error phrasings that mean "request too large for this model's
+ * context window". Exported so callers that classify a raw upstream body — e.g.
+ * the daemon walker's last-resort compaction trigger — reuse the SAME matcher
+ * instead of maintaining a drifting copy.
+ */
+export const CONTEXT_OVERFLOW_BODY =
+  /maximum (prompt|context) length|exceeds the context window|too many tokens|reduce the length of the messages/i;
 // Envoy's first sentence is version-invariant; the trailing reset-reason
 // clause drifts between Envoy versions ("reset reason: …" vs "retried and the
 // latest reset reason: …"), so the matcher pins only the first sentence.

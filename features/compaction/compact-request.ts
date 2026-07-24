@@ -73,9 +73,11 @@ const hasCacheControl = (v: unknown): boolean => {
 };
 
 /**
- * The result of a compaction attempt. `compacted` is false when the body was
- * already within budget OR could not be shrunk to fit (caller then surfaces the
- * original terminal error). `estimatedTokens` is the post-attempt estimate.
+ * The result of a compaction attempt. `compacted` is true when the body fits the
+ * target budget — either it already did (returned untouched) or it was shrunk to
+ * fit. It is false ONLY when compaction could not get it under the target (the
+ * caller then surfaces the original terminal error). `estimatedTokens` is the
+ * post-attempt estimate.
  */
 export type TCompactionResult = {
   readonly body: unknown;
@@ -529,7 +531,8 @@ const lastUserTurnIndex = (messages: ReadonlyArray<unknown>): number =>
  * Recomputes the ruler estimate after each step and stops the moment it fits.
  *
  * `encoding` selects the ruler family for the fit check (defaults inside
- * `estimateBodyTokens`). Returns `compacted:false` when the body already fit or
+ * `estimateBodyTokens`). `compacted` is true when the body fits the target
+ * (already-fit bodies are returned untouched); it is false only when the body
  * could not be shrunk to target — the caller then surfaces its original error.
  */
 export const compactRequestToFit = (

@@ -104,3 +104,15 @@ export const getTokenCounter = async (
 export const peekTokenCounter = (
   encoding: TTokenEncoding,
 ): TTokenCounter | null => counters.get(encoding) ?? null;
+
+/**
+ * TEST-ONLY: drop the per-isolate warm-counter cache so the estimators fall back
+ * to `chars/4` again. The `counters` Map is module-global, so a test that warms
+ * a family (via {@link getTokenCounter}) would otherwise leak the warm ruler
+ * into every later suite in the same process — making a large-body estimate run
+ * the real BPE tokenizer where cold `chars/4` was expected. Call in `afterAll`.
+ */
+export const __resetTokenCountersForTest = (): void => {
+  counters.clear();
+  loading.clear();
+};
