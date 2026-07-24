@@ -212,12 +212,25 @@ export class BpeCounter {
   }
 
   /**
+   * Piece length at or above which the merge switches from the straightforward
+   * scan-and-splice loop to the heap-driven one. The scan loop is O(n²) but
+   * allocation-free and faster in absolute terms for the short pieces that make
+   * up virtually all real text; the heap pays for its typed-array setup only
+   * where the quadratic term would actually dominate. Both produce identical
+   * merge orders, so the threshold can move without changing any count.
+   */
+  private static readonly HEAP_MERGE_MIN_LEN = 64;
+
+  /**
    * The BPE merge loop, returning only the final partition COUNT (never the
    * token ids). Identical merge order to tiktoken/`gpt-tokenizer`, so the count
    * is exact — we just skip building the output id array.
    */
   private bytePairMergeCount(piece: Uint8Array): number {
     if (piece.length === 1) return 1;
+    if (piece.length >= BpeCounter.HEAP_MERGE_MIN_LEN) {
+      return this.bytePairMergeCountHeap(piece);
+    }
 
     const starts: number[] = [];
     const ranks: number[] = [];
@@ -259,5 +272,151 @@ export class BpeCounter {
 
     // One token per surviving partition.
     return starts.length - 1;
+  }
+
+  /**
+   * The same BPE merge, in O(n log n) instead of O(n²).
+   *
+   * The scan-and-splice loop above re-scans every rank to find the minimum and
+   * then does two O(n) `Array.splice`s per merge step. That is fine for short
+   * pieces, but both split regexes admit UNBOUNDED ones — the Claude vocab's
+   * ` ?\p{N}+` has no length cap where real o200k caps digits at `\p{N}{1,3}` —
+   * so a long digit or punctuation run made a single `count()` quadratic
+   * (measured ~36× the time for 8× the input).
+   *
+   * Same algorithm, different bookkeeping:
+   *   - partitions live in a doubly-linked list over byte offsets, so removing
+   *     one is O(1) rather than a splice;
+   *   - a binary min-heap yields the next merge, with stale entries discarded
+   *     lazily via a per-node version counter (cheaper than decrease-key).
+   *
+   * Merge ORDER is preserved exactly, including tiktoken's tie-break: the
+   * original picks the lowest INDEX among equal minimal ranks (its scan uses a
+   * strict `<`), so the heap orders by `(rank, node)` — node id is the byte
+   * offset, which is monotonic in the original's index. Counts are therefore
+   * byte-identical to the scan loop and to tiktoken.
+   */
+  private bytePairMergeCountHeap(piece: Uint8Array): number {
+    const n = piece.length;
+
+    // Node i is the partition starting at byte offset i; node n is the end
+    // sentinel. `next[i] === -1` means "no successor".
+    const prev = new Int32Array(n + 1);
+    const next = new Int32Array(n + 1);
+    for (let i = 0; i <= n; i++) {
+      prev[i] = i - 1;
+      next[i] = i + 1;
+    }
+    next[n] = -1;
+
+    const rank = new Float64Array(n + 1).fill(Number.POSITIVE_INFINITY);
+    const version = new Int32Array(n + 1);
+
+    // Rank of merging node `i`'s partition with its successor's — i.e. the
+    // vocab rank of the bytes spanning both.
+    const rankOf = (i: number): number => {
+      const j = next[i]!;
+      if (j === -1) return Number.POSITIVE_INFINITY;
+      const k = next[j]!;
+      if (k === -1) return Number.POSITIVE_INFINITY;
+      return this.rankOfBytes(piece.subarray(i, k)) ?? Number.POSITIVE_INFINITY;
+    };
+
+    // Binary min-heap over (rank, node), in parallel arrays. Entries carry the
+    // node's version at push time; a popped entry whose version has moved on is
+    // stale and skipped.
+    const heapRank: number[] = [];
+    const heapNode: number[] = [];
+    const heapVer: number[] = [];
+
+    // Lower rank wins; ties break to the lower node id (tiktoken's behaviour).
+    const less = (a: number, b: number): boolean =>
+      heapRank[a] !== heapRank[b]
+        ? heapRank[a]! < heapRank[b]!
+        : heapNode[a]! < heapNode[b]!;
+
+    const swap = (a: number, b: number): void => {
+      [heapRank[a], heapRank[b]] = [heapRank[b]!, heapRank[a]!];
+      [heapNode[a], heapNode[b]] = [heapNode[b]!, heapNode[a]!];
+      [heapVer[a], heapVer[b]] = [heapVer[b]!, heapVer[a]!];
+    };
+
+    const push = (r: number, node: number, ver: number): void => {
+      heapRank.push(r);
+      heapNode.push(node);
+      heapVer.push(ver);
+      let c = heapRank.length - 1;
+      while (c > 0) {
+        const parent = (c - 1) >> 1;
+        if (!less(c, parent)) break;
+        swap(c, parent);
+        c = parent;
+      }
+    };
+
+    const pop = (): number => {
+      const top = 0;
+      const last = heapRank.length - 1;
+      swap(top, last);
+      heapRank.pop();
+      heapNode.pop();
+      heapVer.pop();
+      const size = heapRank.length;
+      let c = 0;
+      for (;;) {
+        const l = 2 * c + 1;
+        const r = l + 1;
+        let smallest = c;
+        if (l < size && less(l, smallest)) smallest = l;
+        if (r < size && less(r, smallest)) smallest = r;
+        if (smallest === c) break;
+        swap(c, smallest);
+        c = smallest;
+      }
+      return last;
+    };
+
+    // Recompute a node's rank and publish it, invalidating its stale entries.
+    const refresh = (i: number): void => {
+      if (i < 0) return;
+      const r = rankOf(i);
+      rank[i] = r;
+      version[i]!++;
+      if (r !== Number.POSITIVE_INFINITY) push(r, i, version[i]!);
+    };
+
+    for (let i = 0; i <= n; i++) {
+      const r = rankOf(i);
+      rank[i] = r;
+      if (r !== Number.POSITIVE_INFINITY) push(r, i, version[i]!);
+    }
+
+    // starts.length - 1 in the scan loop: n + 1 nodes → n partitions.
+    let partitions = n;
+    while (heapRank.length > 0) {
+      const node = heapNode[0]!;
+      const ver = heapVer[0]!;
+      pop();
+      // Stale: the node's rank was recomputed (or it was merged away) after
+      // this entry was pushed.
+      if (ver !== version[node]) continue;
+      const j = next[node]!;
+      if (j === -1) continue;
+
+      // Merge `node` with its successor: unlink the successor.
+      const k = next[j]!;
+      next[node] = k;
+      if (k !== -1) prev[k] = node;
+      // Any pending entry for the removed node is now stale.
+      version[j]!++;
+      rank[j] = Number.POSITIVE_INFINITY;
+      partitions--;
+
+      // Only this node's rank and its predecessor's can have changed.
+      refresh(node);
+      refresh(prev[node]!);
+    }
+
+    return partitions;
   }
 }
