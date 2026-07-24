@@ -115,6 +115,15 @@ const compareUint8Arrays = (a: Uint8Array, b: Uint8Array): number => {
  */
 const MERGE_COUNT_CACHE_MAX = 8192;
 
+/**
+ * Longest piece worth caching. Entry COUNT alone doesn't bound the memory: both
+ * split regexes admit unbounded pieces (the Claude vocab's ` ?\p{N}+` has no
+ * length cap, unlike o200k's `\p{N}{1,3}`), so a single pathological run could
+ * pin megabytes. Long pieces are also the least likely to recur, so skipping
+ * them costs nothing in hit rate.
+ */
+const MERGE_COUNT_CACHE_MAX_PIECE = 512;
+
 export class BpeCounter {
   private readonly stringRankEncoder = new Map<string, number>();
   private readonly binarySortedEncoder: [Uint8Array, number][] = [];
@@ -171,10 +180,12 @@ export class BpeCounter {
         continue;
       }
       const merged = this.bytePairMergeCount(textEncoder.encode(match));
-      if (this.mergeCountCache.size >= MERGE_COUNT_CACHE_MAX) {
-        this.mergeCountCache.clear();
+      if (match.length <= MERGE_COUNT_CACHE_MAX_PIECE) {
+        if (this.mergeCountCache.size >= MERGE_COUNT_CACHE_MAX) {
+          this.mergeCountCache.clear();
+        }
+        this.mergeCountCache.set(match, merged);
       }
-      this.mergeCountCache.set(match, merged);
       tokensCount += merged;
     }
     return tokensCount;

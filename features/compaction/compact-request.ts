@@ -729,12 +729,19 @@ export const compactRequestToFit = (
   // body cost 400+ full-body estimates and ~19 M characters of tokenizer work.
   //
   // Instead, cost each message ONCE (memoized by identity) and track the total
-  // as a sum. Every message's text is now walked a single time across the whole
-  // loop. The sum of per-message estimates is not bit-identical to one estimate
-  // over the assembled body (per-part rounding, and the BPE can't merge across
-  // parts), so it is used only to decide WHERE to stop dropping — the exact
-  // whole-body estimate below still decides the reported size and `compacted`,
-  // and if the approximation stopped short we finish the job exactly.
+  // as a sum, so every message's text is walked a single time across the loop.
+  //
+  // The sum of per-message estimates is NOT the estimate of the assembled body:
+  // each part is rounded up independently, so the sum OVER-states the whole by
+  // up to ~1 token per part. Used directly that would make the loop keep
+  // dropping until the inflated figure fits — over-shrinking the request, the
+  // exact failure `1336079a` (deficit-driven truncation cap) set out to stop.
+  //
+  // So the loop predicate is deliberately a LOWER bound (the sum minus that
+  // per-part rounding slack). A lower bound can only ever stop dropping EARLY,
+  // never late — so it can never over-shrink, and the exact whole-body pass
+  // below finishes the job in the rare case it stopped short. The exact
+  // estimate remains the sole authority for the reported size and `compacted`.
   const messagelessBody: TRecord = { ...body };
   delete messagelessBody.messages;
   const baseCost = estimate(messagelessBody);
@@ -749,7 +756,8 @@ export const compactRequestToFit = (
   const approxFits = (msgs: ReadonlyArray<unknown>): boolean => {
     let total = baseCost;
     for (const m of msgs) total += costOf(m);
-    return total <= targetTokens;
+    // Discount the per-part ceil() slack to keep this a lower bound.
+    return total - msgs.length <= targetTokens;
   };
 
   messages = dropOldestTurns(messages, anthropic, approxFits);
@@ -757,9 +765,8 @@ export const compactRequestToFit = (
   let finalBody = withMessages(messages);
   let finalEst = estimate(finalBody);
   if (finalEst > targetTokens) {
-    // The cheap sum over-estimated and we stopped too early. Finish with the
-    // exact predicate — correctness is preserved, and this path only runs when
-    // the approximation actually fell short.
+    // The lower bound stopped us early — finish with the exact predicate. Only
+    // the remaining gap is walked, so this stays cheap.
     messages = dropOldestTurns(
       messages,
       anthropic,
