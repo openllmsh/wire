@@ -329,6 +329,100 @@ const toolCallArguments = (item: Record<string, unknown>): string => {
   return stringField(item, "arguments") ?? "";
 };
 
+/** Emit a completed or max-token-truncated canonical terminal chunk. */
+const terminalChunk = (
+  response: Record<string, unknown> | undefined,
+  state: TChatGptStreamState,
+  options: TChatGptProviderOptions,
+  truncated: boolean,
+): TChatCompletionChunk => {
+  // Prefer per-stream state: we already counted every
+  // `response.output_item.added` tool item and every
+  // `response.function_call_arguments.delta` as we walked the stream, so we
+  // don't depend on whatever shape the terminal event chooses to ship
+  // `response.output[]` in. Fall back to a structural check on
+  // `response.output[]` so single-event unit tests still observe the correct
+  // finish_reason.
+  let hasToolCall = state.hasToolCall;
+  if (!hasToolCall) {
+    const output = response !== undefined ? response.output : undefined;
+    if (Array.isArray(output)) {
+      for (const item of output) {
+        if (
+          item !== null &&
+          typeof item === "object" &&
+          // A server-search item (grok x_* custom_tool_call) is NOT a client
+          // tool call — it must not flip the turn to "tool_calls".
+          !isServerSearchItem(item as Record<string, unknown>) &&
+          isToolCallItem(item as Record<string, unknown>)
+        ) {
+          hasToolCall = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Fold any reasoning items that only appeared in the terminal
+  // `response.output[]` snapshot (some gpt-5.x-codex responses omit the
+  // per-item `.done` event). Mirrors litellm 1321-1356.
+  const terminalOutput = response !== undefined ? response.output : undefined;
+  if (Array.isArray(terminalOutput)) {
+    for (const item of terminalOutput) {
+      if (item !== null && typeof item === "object" && !Array.isArray(item)) {
+        captureReasoningItem(state, item as Record<string, unknown>);
+      }
+    }
+  }
+  const reasoningItems = drainUnemittedReasoning(state);
+
+  let usage: TChatCompletionChunk["usage"] | undefined;
+  const usageRaw =
+    response !== undefined ? objectField(response, "usage") : undefined;
+  if (usageRaw !== undefined) {
+    const inTok = numberField(usageRaw, "input_tokens") ?? 0;
+    const outTok = numberField(usageRaw, "output_tokens") ?? 0;
+    const inDetails = objectField(usageRaw, "input_tokens_details");
+    const outDetails = objectField(usageRaw, "output_tokens_details");
+    const cached =
+      inDetails !== undefined
+        ? numberField(inDetails, "cached_tokens")
+        : undefined;
+    const reasoning =
+      outDetails !== undefined
+        ? numberField(outDetails, "reasoning_tokens")
+        : undefined;
+    usage = {
+      prompt_tokens: inTok,
+      completion_tokens: outTok,
+      total_tokens: inTok + outTok,
+      ...(cached !== undefined
+        ? { prompt_tokens_details: { cached_tokens: cached } }
+        : {}),
+      ...(reasoning !== undefined
+        ? { completion_tokens_details: { reasoning_tokens: reasoning } }
+        : {}),
+    };
+  }
+
+  return {
+    ...baseChunk(options),
+    choices: [
+      {
+        index: 0,
+        delta:
+          reasoningItems.length > 0 ? { reasoning_items: reasoningItems } : {},
+        finish_reason: truncated
+          ? "length"
+          : hasToolCall
+            ? "tool_calls"
+            : "stop",
+      },
+    ],
+    ...(usage !== undefined ? { usage } : {}),
+  };
+};
+
 /**
  * Translate one Responses API streaming event into one ChatCompletion
  * chunk. Returns null for events we ignore (heartbeats, `response.created`
@@ -519,35 +613,40 @@ export const chatGptEventToChunk = (
     };
   }
 
-  // `response.failed` / `response.incomplete` / `response.error` are
-  // chatgpt.com's way of saying the upstream gave up mid-stream. Without
-  // surfacing these we silently close the stream and the proxy
-  // accumulator builds an empty content array, which Claude Code
-  // rejects as "no valid text content" (observed on `/compact`).
-  // Throw so the runner converts it into an SSE `event: error` for
-  // streaming clients and a 502 envelope for non-streaming clients.
+  const response = objectField(event, "response");
+  const incomplete =
+    response !== undefined
+      ? objectField(response, "incomplete_details")
+      : undefined;
+  // Hitting the configured output limit is a well-formed partial turn, not an
+  // upstream failure. Clients can resume it only when they receive an honest
+  // `finish_reason: "length"` terminal chunk.
+  if (
+    type === "response.incomplete" &&
+    stringField(incomplete ?? {}, "reason") === "max_output_tokens"
+  ) {
+    return terminalChunk(response, state, options, true);
+  }
+
+  // `response.failed`, error, and incomplete reasons other than the configured
+  // output limit mean the upstream gave up mid-stream. Throw so the runner
+  // converts them into an SSE error frame for streaming clients and a 502
+  // envelope for non-streaming clients.
   if (
     type === "response.failed" ||
     type === "response.incomplete" ||
     type === "error"
   ) {
-    const response = objectField(event, "response");
     const errorObj =
       objectField(event, "error") ??
       (response !== undefined ? objectField(response, "error") : undefined);
     // `error` events carry top-level `code`/`message` (Responses spec);
-    // `response.incomplete` carries `response.incomplete_details.reason`
-    // (e.g. "max_output_tokens"). Both were previously dropped, leaving
-    // only "upstream chatgpt <type>" — the one diagnostic the client gets.
-    // An EMPTY string field is treated as absent so the next fallback runs
-    // (a `""` message/code would otherwise win the chain and blank the
-    // diagnostic).
+    // non-max-token `response.incomplete` events carry
+    // `response.incomplete_details.reason`. An EMPTY string field is treated
+    // as absent so the next fallback runs (a `""` message/code would otherwise
+    // win the chain and blank the diagnostic).
     const nonEmpty = (s: string | undefined): string | undefined =>
       s !== undefined && s.length > 0 ? s : undefined;
-    const incomplete =
-      response !== undefined
-        ? objectField(response, "incomplete_details")
-        : undefined;
     const message =
       (errorObj !== undefined
         ? nonEmpty(stringField(errorObj, "message"))
@@ -574,93 +673,7 @@ export const chatGptEventToChunk = (
   }
 
   if (type === "response.completed") {
-    const response = objectField(event, "response");
-    // Prefer per-stream state: we already counted every
-    // `response.output_item.added` tool item and every
-    // `response.function_call_arguments.delta` as we walked the
-    // stream, so we don't depend on whatever shape the terminal
-    // event chooses to ship `response.output[]` in. Fall back to
-    // a structural check on `response.output[]` so single-event
-    // unit tests (which call this without first feeding the added
-    // event) still observe the correct finish_reason.
-    let hasToolCall = state.hasToolCall;
-    if (!hasToolCall) {
-      const output = response !== undefined ? response.output : undefined;
-      if (Array.isArray(output)) {
-        for (const item of output) {
-          if (
-            item !== null &&
-            typeof item === "object" &&
-            // A server-search item (grok x_* custom_tool_call) is NOT a
-            // client tool call — it must not flip the turn to "tool_calls".
-            !isServerSearchItem(item as Record<string, unknown>) &&
-            isToolCallItem(item as Record<string, unknown>)
-          ) {
-            hasToolCall = true;
-            break;
-          }
-        }
-      }
-    }
-    const finishReason = hasToolCall ? "tool_calls" : "stop";
-
-    // Fold any reasoning items that only appeared in the terminal
-    // `response.output[]` snapshot (some gpt-5.x-codex responses omit
-    // the per-item `.done` event). Mirrors litellm 1321-1356.
-    const completedOutput =
-      response !== undefined ? response.output : undefined;
-    if (Array.isArray(completedOutput)) {
-      for (const item of completedOutput) {
-        if (item !== null && typeof item === "object" && !Array.isArray(item)) {
-          captureReasoningItem(state, item as Record<string, unknown>);
-        }
-      }
-    }
-    const reasoningItems = drainUnemittedReasoning(state);
-
-    let usage: TChatCompletionChunk["usage"] | undefined;
-    const usageRaw =
-      response !== undefined ? objectField(response, "usage") : undefined;
-    if (usageRaw !== undefined) {
-      const inTok = numberField(usageRaw, "input_tokens") ?? 0;
-      const outTok = numberField(usageRaw, "output_tokens") ?? 0;
-      const inDetails = objectField(usageRaw, "input_tokens_details");
-      const outDetails = objectField(usageRaw, "output_tokens_details");
-      const cached =
-        inDetails !== undefined
-          ? numberField(inDetails, "cached_tokens")
-          : undefined;
-      const reasoning =
-        outDetails !== undefined
-          ? numberField(outDetails, "reasoning_tokens")
-          : undefined;
-      usage = {
-        prompt_tokens: inTok,
-        completion_tokens: outTok,
-        total_tokens: inTok + outTok,
-        ...(cached !== undefined
-          ? { prompt_tokens_details: { cached_tokens: cached } }
-          : {}),
-        ...(reasoning !== undefined
-          ? { completion_tokens_details: { reasoning_tokens: reasoning } }
-          : {}),
-      };
-    }
-
-    return {
-      ...baseChunk(options),
-      choices: [
-        {
-          index: 0,
-          delta:
-            reasoningItems.length > 0
-              ? { reasoning_items: reasoningItems }
-              : {},
-          finish_reason: finishReason,
-        },
-      ],
-      ...(usage !== undefined ? { usage } : {}),
-    };
+    return terminalChunk(response, state, options, false);
   }
 
   // response.in_progress / response.content_part.* / response.created

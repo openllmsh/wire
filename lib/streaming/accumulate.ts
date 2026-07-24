@@ -6,6 +6,13 @@ import type {
 } from "@openllmsh/protocol";
 
 import { plainTextFromReasoningItems } from "../../adapters/messages/reasoning-from-items";
+import { IncompleteStreamError } from "./upstream-error";
+
+const ZERO_USAGE: TChatCompletionResponse["usage"] = {
+  prompt_tokens: 0,
+  completion_tokens: 0,
+  total_tokens: 0,
+};
 
 // runtime-only: builder state while we walk a chunk stream. Tool calls
 // arrive as `{index, id?, function:{name?, arguments?}}` deltas that
@@ -34,11 +41,8 @@ export const accumulateChunksToResponse = async (
   let content = "";
   let finishReason: TChatCompletionResponse["choices"][number]["finish_reason"] =
     null;
-  let usage: TChatCompletionResponse["usage"] = {
-    prompt_tokens: 0,
-    completion_tokens: 0,
-    total_tokens: 0,
-  };
+  let usage: TChatCompletionResponse["usage"] = ZERO_USAGE;
+  let sawUsage = false;
   let id = "";
   let created = Math.floor(Date.now() / 1000);
   const toolCalls = new Map<number, TToolCallBuilder>();
@@ -58,8 +62,13 @@ export const accumulateChunksToResponse = async (
       if (choice === undefined) {
         if (value.usage !== undefined && value.usage !== null) {
           usage = value.usage;
+          sawUsage = true;
         }
         continue;
+      }
+      if (value.usage !== undefined && value.usage !== null) {
+        usage = value.usage;
+        sawUsage = true;
       }
       const delta = choice.delta;
       if (delta !== undefined) {
@@ -109,7 +118,9 @@ export const accumulateChunksToResponse = async (
     // discarding the whole turn (issue #274). A failure BEFORE the terminal
     // chunk still rejects: the answer is incomplete and the error is the
     // only truthful outcome.
-    if (finishReason === null) throw err;
+    if (finishReason === null) {
+      throw new IncompleteStreamError(err, sawUsage ? usage : null);
+    }
     // Same debug gate as provider-decode's dropped-chunk warning: keep the
     // salvage observable without adding a logger dep to the pure wire layer.
     if (process.env.OPENLLM_DEBUG_STREAM === "1") {

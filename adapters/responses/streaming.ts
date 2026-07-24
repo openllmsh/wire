@@ -1,4 +1,5 @@
 import type { TChatCompletionChunk } from "@openllmsh/protocol";
+import { upstreamErrorFrom } from "../../lib/streaming/upstream-error";
 
 /**
  * Outbound adapter (streaming): canonical ChatCompletion chunks → OpenAI
@@ -264,7 +265,24 @@ export const chunksToResponsesSseBytes = (
           // else: nothing emittable (e.g. a role-only opener) — read again.
         }
       } catch (err) {
-        controller.error(err);
+        const { type, message } = upstreamErrorFrom(err);
+        // Emit a terminal failed event so the client sees a cleanly-closed
+        // stream and can handle the error as a failure instead of an abrupt
+        // transport abort. This mirrors sibling adapters (chatgpt wire and
+        // Anthropic adapters) that emit explicit failure/error frames on
+        // mid-stream faults.
+        controller.enqueue(
+          ev("response.failed", {
+            response: {
+              ...responseObject("failed"),
+              error: {
+                type,
+                message,
+              },
+            },
+          }),
+        );
+        controller.close();
       }
     },
     cancel() {
