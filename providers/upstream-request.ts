@@ -71,16 +71,49 @@ const inlineAnthropicSystemContent = (content: unknown): unknown[] =>
       : [];
 
 /**
+ * Models that REJECT mid-conversation `role: "system"` messages with
+ * `role 'system' is not supported on this model`. Deny-list (mirroring
+ * `NO_ADAPTIVE_THINKING`) so an unknown future opus/sonnet keeps the verbatim
+ * path without a code change; the set of non-supporters is small and stable.
+ */
+const NO_INLINE_SYSTEM_ROLE = /haiku|claude-3|claude-instant/i;
+
+/**
+ * True when the resolved model tolerates inline `role: "system"` messages and
+ * so must NOT be rewritten. Empty/unknown ids fail open (no rewrite) — the
+ * real tokenizer gets the last word, and a needless rewrite is far more
+ * expensive than a walkable 400 (see `hoistInlineAnthropicSystemMessages`).
+ */
+const supportsInlineSystemRole = (model: unknown): boolean =>
+  typeof model !== "string" ||
+  model.length === 0 ||
+  !NO_INLINE_SYSTEM_ROLE.test(model);
+
+/**
  * Claude Code can emit mid-conversation `role: "system"` messages, but only
  * models that opt into that extension accept them. Same-wire passthrough must
  * therefore hoist them into the universally accepted top-level `system` field
  * before selecting an upstream model such as Haiku. Keep content blocks
  * verbatim: unlike the cross-wire encoder's text-only canonical system form,
  * this operates on an already Anthropic-shaped request.
+ *
+ * GATED on the resolved model rejecting the inline form, because the hoist is
+ * a PREFIX-DESTABILISING rewrite: it appends to `system` (past the client's
+ * `cache_control` breakpoint) and re-indexes `messages`, so the cached prefix
+ * ends at the last system breakpoint and the entire tail is re-cached on EVERY
+ * turn. Applying it unconditionally (v1.7.14, commit e6ac9b93) pinned Claude
+ * Code's `cache_read` at a constant ~91k while writing 250k+ per request —
+ * uncached input went from ~0.001% to ~10% of tokens and cache writes 3-5×,
+ * draining subscription quota. Same rule `features/context-skip.ts` states:
+ * per-request rewrites destabilise the prefix (cache misses → quota drain).
+ * It also keeps the genuine Claude Code subscription hop byte-verbatim, which
+ * the AUP guarantee (commit 31bba275) requires — `withClaudePreamble` only
+ * gates the gateway PREFIX, never this rewrite.
  */
 const hoistInlineAnthropicSystemMessages = (
   body: Record<string, unknown>,
 ): Record<string, unknown> => {
+  if (supportsInlineSystemRole(body.model)) return body;
   if (!Array.isArray(body.messages)) return body;
 
   const inlineSystemMessages = body.messages.filter(
