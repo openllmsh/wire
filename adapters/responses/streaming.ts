@@ -271,6 +271,14 @@ export const chunksToResponsesSseBytes = (
         // transport abort. This mirrors sibling adapters (chatgpt wire and
         // Anthropic adapters) that emit explicit failure/error frames on
         // mid-stream faults.
+        if (!createdEmitted) {
+          controller.enqueue(
+            ev("response.created", {
+              response: responseObject("in_progress"),
+            }),
+          );
+          createdEmitted = true;
+        }
         controller.enqueue(
           ev("response.failed", {
             response: {

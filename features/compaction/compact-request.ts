@@ -193,8 +193,8 @@ const isAnthropic = (surface: TCompactionSurface): boolean =>
 /**
  * Rewrite the text inside a single Anthropic `tool_result` block, capping its
  * serialized size. `content` is `string | block[]`; string form truncates
- * directly, block-array form truncates each `text` block in place (order + type
- * + sibling fields preserved — image/document blocks untouched).
+ * directly, block-array form shares a single budget across `text` parts in order,
+ * leaving non-text parts untouched.
  */
 const truncateAnthropicToolResult = (
   block: TRecord,
@@ -205,11 +205,23 @@ const truncateAnthropicToolResult = (
     return { ...block, content: truncateMiddleToChars(content, maxChars) };
   }
   if (Array.isArray(content)) {
-    const next = content.map((inner) =>
-      isRecord(inner) && inner.type === "text" && typeof inner.text === "string"
-        ? { ...inner, text: truncateMiddleToChars(inner.text, maxChars) }
-        : inner,
-    );
+    let remainingChars = maxChars;
+    const next = content.map((inner) => {
+      if (
+        !isRecord(inner) ||
+        inner.type !== "text" ||
+        typeof inner.text !== "string"
+      ) {
+        return inner;
+      }
+      if (remainingChars <= 0) {
+        return { ...inner, text: "" };
+      }
+      const text = truncateMiddleToChars(inner.text, remainingChars);
+      remainingChars = Math.max(0, remainingChars - text.length);
+      if (text === inner.text) return inner;
+      return { ...inner, text };
+    });
     return { ...block, content: next };
   }
   return block;
