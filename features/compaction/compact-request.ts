@@ -205,6 +205,10 @@ const truncateAnthropicToolResult = (
     return { ...block, content: truncateMiddleToChars(content, maxChars) };
   }
   if (Array.isArray(content)) {
+    // Share one maxChars budget across text parts, oldest→newest. When the
+    // remainder drops below COMPACTION_MIN_VISIBLE_TEXT_CHARS, hard-slice
+    // instead of calling truncateMiddleToChars (which floors up to the min
+    // and would overshoot the shared budget).
     let remainingChars = maxChars;
     const next = content.map((inner) => {
       if (
@@ -217,7 +221,12 @@ const truncateAnthropicToolResult = (
       if (remainingChars <= 0) {
         return { ...inner, text: "" };
       }
-      const text = truncateMiddleToChars(inner.text, remainingChars);
+      const text =
+        inner.text.length <= remainingChars
+          ? inner.text
+          : remainingChars < COMPACTION_MIN_VISIBLE_TEXT_CHARS
+            ? inner.text.slice(0, remainingChars)
+            : truncateMiddleToChars(inner.text, remainingChars);
       remainingChars = Math.max(0, remainingChars - text.length);
       if (text === inner.text) return inner;
       return { ...inner, text };
