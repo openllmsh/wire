@@ -208,19 +208,21 @@ const truncateAnthropicToolResult = (
     // Share one maxChars budget across text parts, oldest→newest. When the
     // remainder drops below COMPACTION_MIN_VISIBLE_TEXT_CHARS, hard-slice
     // instead of calling truncateMiddleToChars (which floors up to the min
-    // and would overshoot the shared budget).
+    // and would overshoot the shared budget). Exhausted text parts are
+    // dropped (not left as empty `{type:"text", text:""}` blocks) so the
+    // wire body stays vendor-clean; non-text siblings always survive.
     let remainingChars = maxChars;
-    const next = content.map((inner) => {
+    const next: unknown[] = [];
+    for (const inner of content) {
       if (
         !isRecord(inner) ||
         inner.type !== "text" ||
         typeof inner.text !== "string"
       ) {
-        return inner;
+        next.push(inner);
+        continue;
       }
-      if (remainingChars <= 0) {
-        return { ...inner, text: "" };
-      }
+      if (remainingChars <= 0) continue;
       const text =
         inner.text.length <= remainingChars
           ? inner.text
@@ -228,9 +230,9 @@ const truncateAnthropicToolResult = (
             ? inner.text.slice(0, remainingChars)
             : truncateMiddleToChars(inner.text, remainingChars);
       remainingChars = Math.max(0, remainingChars - text.length);
-      if (text === inner.text) return inner;
-      return { ...inner, text };
-    });
+      if (text.length === 0) continue;
+      next.push(text === inner.text ? inner : { ...inner, text });
+    }
     return { ...block, content: next };
   }
   return block;
