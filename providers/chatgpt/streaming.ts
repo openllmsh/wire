@@ -56,6 +56,18 @@ export type TChatGptStreamState = {
   argsStreamedIndexes: Set<number>;
   /** `output_index`es whose authoritative `.done` args were emitted. */
   argsFinalizedIndexes: Set<number>;
+  /**
+   * `web_search_call` entries are lifecycle split (`search` + `open_page`) and
+   * must be coalesced by id so one logical source-search counts as one request.
+   */
+  serverSearchById: Map<
+    string,
+    {
+      query: string;
+      queries?: ReadonlyArray<string>;
+      results: ReadonlyArray<{ url: string }>;
+    }
+  >;
 };
 
 export const newChatGptStreamState = (
@@ -66,6 +78,7 @@ export const newChatGptStreamState = (
   emittedReasoningIds: new Set(),
   argsStreamedIndexes: new Set(),
   argsFinalizedIndexes: new Set(),
+  serverSearchById: new Map(),
 });
 
 /**
@@ -174,6 +187,26 @@ const objectField = (
     : undefined;
 };
 
+const arrayField = (
+  obj: Record<string, unknown>,
+  key: string,
+): Array<unknown> | undefined => {
+  const v = obj[key];
+  return Array.isArray(v) ? v : undefined;
+};
+
+const stringArrayField = (
+  obj: Record<string, unknown>,
+  key: string,
+): ReadonlyArray<string> | undefined => {
+  const values = arrayField(obj, key);
+  if (values === undefined) return undefined;
+  const strings = values.filter(
+    (value): value is string => typeof value === "string",
+  );
+  return strings.length > 0 ? strings : undefined;
+};
+
 // apply_patch arrives as a dedicated `apply_patch`/`apply_patch_call` item OR
 // as a `custom_tool_call` NAMED `apply_patch` (Codex). `custom_tool_call` is
 // NOT itself an apply_patch marker — a bare `custom_tool_call` is an ordinary
@@ -243,36 +276,56 @@ const isServerSearchItem = (item: Record<string, unknown>): boolean => {
   );
 };
 
-/** Map a COMPLETED server-search output item to its canonical call. */
+/**
+ * Decode a COMPLETED server-search item. Codex represents one logical query as
+ * a `search` item followed by one or more `open_page` items with distinct ids.
+ * The caller attaches those page URLs to the preceding search instead of
+ * emitting page operations as new searches, keeping Claude Code's count useful.
+ */
+type TServerSearchItem =
+  | {
+      kind: "search";
+      id: string;
+      query: string;
+      queries?: ReadonlyArray<string>;
+      results: ReadonlyArray<{ url: string }>;
+    }
+  | { kind: "open_page"; url: string }
+  | { kind: "immediate"; call: TServerSearchCall };
+
 const serverSearchOfItem = (
   item: Record<string, unknown>,
-): TServerSearchCall | null => {
+): TServerSearchItem | null => {
   if (!isServerSearchItem(item)) return null;
-  const id = stringField(item, "id") ?? stringField(item, "call_id");
-  if (id === undefined) return null;
   const type = stringField(item, "type");
   if (type === "web_search_call") {
     const action = objectField(item, "action");
+    if (action === undefined) return null;
+    const url = stringField(action, "url");
+    if (url !== undefined) return { kind: "open_page", url };
+    const id = stringField(item, "id") ?? stringField(item, "call_id");
+    if (id === undefined) return null;
     const query =
-      (action !== undefined ? stringField(action, "query") : undefined) ??
+      stringField(action, "query") ??
       stringField(item, "query") ??
+      stringArrayField(action, "queries")?.[0] ??
       "";
-    const sources = action?.sources;
-    const results = Array.isArray(sources)
-      ? sources.flatMap((s): Array<{ url: string }> => {
-          const url =
-            s !== null && typeof s === "object"
-              ? stringField(s as Record<string, unknown>, "url")
-              : undefined;
-          return url !== undefined ? [{ url }] : [];
-        })
-      : [];
-    return {
-      id,
-      query,
-      ...(results.length > 0 ? { results } : {}),
-    };
+    const queries = stringArrayField(action, "queries");
+    const sources = arrayField(action, "sources");
+    const results =
+      sources === undefined
+        ? []
+        : sources.flatMap((source): Array<{ url: string }> => {
+            const url =
+              source !== null && typeof source === "object"
+                ? stringField(source as Record<string, unknown>, "url")
+                : undefined;
+            return url === undefined ? [] : [{ url }];
+          });
+    return { kind: "search", id, query, queries, results };
   }
+  const id = stringField(item, "id") ?? stringField(item, "call_id");
+  if (id === undefined) return null;
   // x_* custom tool — query rides the JSON `input` string.
   let query = "";
   try {
@@ -281,9 +334,9 @@ const serverSearchOfItem = (
     };
     if (typeof input.query === "string") query = input.query;
   } catch {
-    // unparseable input — report the search with an empty query
+    // Unparseable input — report the search with an empty query.
   }
-  return { id, query };
+  return { kind: "immediate", call: { id, query } };
 };
 
 const toolCallId = (item: Record<string, unknown>): string | undefined =>
@@ -375,6 +428,15 @@ const terminalChunk = (
     }
   }
   const reasoningItems = drainUnemittedReasoning(state);
+  const serverSearchCalls = [...state.serverSearchById.entries()].map(
+    ([id, search]): TServerSearchCall => ({
+      id,
+      query: search.query,
+      ...(search.queries !== undefined ? { queries: [...search.queries] } : {}),
+      ...(search.results.length > 0 ? { results: [...search.results] } : {}),
+    }),
+  );
+  state.serverSearchById.clear();
 
   let usage: TChatCompletionChunk["usage"] | undefined;
   const usageRaw =
@@ -410,8 +472,14 @@ const terminalChunk = (
     choices: [
       {
         index: 0,
-        delta:
-          reasoningItems.length > 0 ? { reasoning_items: reasoningItems } : {},
+        delta: {
+          ...(reasoningItems.length > 0
+            ? { reasoning_items: reasoningItems }
+            : {}),
+          ...(serverSearchCalls.length > 0
+            ? { server_search_calls: serverSearchCalls }
+            : {}),
+        },
         finish_reason: truncated
           ? "length"
           : hasToolCall
@@ -487,16 +555,61 @@ export const chatGptEventToChunk = (
     if (item !== undefined) {
       const search = serverSearchOfItem(item);
       if (search !== null) {
-        return {
-          ...baseChunk(options),
-          choices: [
-            {
-              index: 0,
-              delta: { server_search_calls: [search] },
-              finish_reason: null,
-            },
-          ],
-        };
+        if (search.kind === "immediate") {
+          return {
+            ...baseChunk(options),
+            choices: [
+              {
+                index: 0,
+                delta: { server_search_calls: [search.call] },
+                finish_reason: null,
+              },
+            ],
+          };
+        }
+        if (search.kind === "search") {
+          // Grok supplies sources on the same item, so it is immediately
+          // self-contained. Codex search items wait for trailing open_page
+          // lifecycle entries; terminal emission prevents one count per URL.
+          if (search.results.length > 0) {
+            return {
+              ...baseChunk(options),
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    server_search_calls: [
+                      {
+                        id: search.id,
+                        query: search.query,
+                        ...(search.queries !== undefined
+                          ? { queries: [...search.queries] }
+                          : {}),
+                        results: [...search.results],
+                      },
+                    ],
+                  },
+                  finish_reason: null,
+                },
+              ],
+            };
+          }
+          state.serverSearchById.set(search.id, {
+            query: search.query,
+            queries: search.queries,
+            results: [],
+          });
+          return null;
+        }
+        const pending = [...state.serverSearchById.entries()].at(-1);
+        if (pending !== undefined) {
+          const [id, call] = pending;
+          state.serverSearchById.set(id, {
+            ...call,
+            results: [...call.results, { url: search.url }],
+          });
+        }
+        return null;
       }
     }
     if (item !== undefined) captureReasoningItem(state, item);

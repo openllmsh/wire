@@ -6,3 +6,4 @@
 export * from "./common";
 export * from "./request";
 export * from "./streaming";
+export * from "./web-search";
