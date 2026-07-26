@@ -30,19 +30,29 @@ export const GROK_NATIVE_SEARCH_TOOLS: ReadonlyArray<
  * unchanged; the payload is otherwise untouched. Idempotent-ish: native
  * entries are only appended when absent.
  */
+const isCanonicalSearchTool = (tool: unknown): boolean =>
+  tool !== null &&
+  typeof tool === "object" &&
+  (tool as { readonly type?: unknown }).type === "function" &&
+  (tool as { readonly name?: unknown }).name === "web_search";
+
+/**
+ * A FORCED choice naming the canonicalised `web_search` function. The
+ * Responses wire spells this flat (`{type:"function", name}`) — see
+ * `toResponsesToolChoice` in `../chatgpt/request.ts`.
+ */
+const isForcedCanonicalSearchChoice = (choice: unknown): boolean =>
+  choice !== null &&
+  typeof choice === "object" &&
+  (choice as { readonly type?: unknown }).type === "function" &&
+  (choice as { readonly name?: unknown }).name === "web_search";
+
 export const withGrokNativeSearch = (body: unknown): unknown => {
   if (body === null || typeof body !== "object") return body;
   const record = body as Record<string, unknown>;
+  const { tool_choice: toolChoice, ...rest } = record;
   const tools = Array.isArray(record.tools) ? record.tools : [];
-  const kept = tools.filter(
-    (t) =>
-      !(
-        t !== null &&
-        typeof t === "object" &&
-        (t as { readonly type?: unknown }).type === "function" &&
-        (t as { readonly name?: unknown }).name === "web_search"
-      ),
-  );
+  const kept = tools.filter((t) => !isCanonicalSearchTool(t));
   const present = new Set(
     kept.flatMap((t) =>
       t !== null &&
@@ -55,5 +65,23 @@ export const withGrokNativeSearch = (body: unknown): unknown => {
   const injected = GROK_NATIVE_SEARCH_TOOLS.filter(
     (t) => !present.has(t.type as string),
   );
-  return { ...record, tools: [...kept, ...injected] };
+  // No early no-op return here, unlike the chatgpt twin: the walker calls this
+  // ONLY on a search-declared turn, where injecting the native tools is the
+  // whole point — a body that merely lacks the canonical function still needs
+  // them. (Prompt-cache prefix stability is not at stake either: this rewrites
+  // an OUTBOUND Responses payload, not the Anthropic `system`/`messages`
+  // prefix that carries the client's `cache_control` breakpoints.)
+  return {
+    ...rest,
+    tools: [...kept, ...injected],
+    // A client that DECLARED the Anthropic server tool may also FORCE it
+    // (`tool_choice: {type:"tool", name:"web_search"}`), which canonicalises
+    // to a forced function choice. That function is gone now, so keeping the
+    // choice would point the payload at a tool it no longer carries — an
+    // upstream-rejection risk. Drop only that choice; anything else (including
+    // a forced choice naming a DIFFERENT function) passes through.
+    ...(toolChoice !== undefined && !isForcedCanonicalSearchChoice(toolChoice)
+      ? { tool_choice: toolChoice }
+      : {}),
+  };
 };
