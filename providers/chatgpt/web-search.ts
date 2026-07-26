@@ -26,19 +26,24 @@ export const CHATGPT_NATIVE_SEARCH_TOOL: Readonly<Record<string, unknown>> = {
  * through unchanged and in order. Re-applying the transform does not add a
  * duplicate native tool.
  */
+const isCanonicalSearchTool = (tool: unknown): boolean =>
+  tool !== null &&
+  typeof tool === "object" &&
+  (tool as { readonly type?: unknown }).type === "function" &&
+  (tool as { readonly name?: unknown }).name === "web_search";
+
+const isForcedCanonicalSearchChoice = (choice: unknown): boolean =>
+  choice !== null &&
+  typeof choice === "object" &&
+  (choice as { readonly type?: unknown }).type === "function" &&
+  (choice as { readonly name?: unknown }).name === "web_search";
+
 export const withChatGptNativeSearch = (body: unknown): unknown => {
   if (body === null || typeof body !== "object") return body;
   const record = body as Record<string, unknown>;
+  const { tool_choice: toolChoice, ...rest } = record;
   const tools = Array.isArray(record.tools) ? record.tools : [];
-  const kept = tools.filter(
-    (tool) =>
-      !(
-        tool !== null &&
-        typeof tool === "object" &&
-        (tool as { readonly type?: unknown }).type === "function" &&
-        (tool as { readonly name?: unknown }).name === "web_search"
-      ),
-  );
+  const kept = tools.filter((tool) => !isCanonicalSearchTool(tool));
   const removedCanonicalSearch = kept.length !== tools.length;
   const nativeSearchPresent = kept.some(
     (tool) =>
@@ -47,8 +52,12 @@ export const withChatGptNativeSearch = (body: unknown): unknown => {
       (tool as { readonly type?: unknown }).type === "web_search",
   );
   if (!removedCanonicalSearch && !nativeSearchPresent) return body;
+
   return {
-    ...record,
+    ...rest,
     tools: nativeSearchPresent ? kept : [...kept, CHATGPT_NATIVE_SEARCH_TOOL],
+    ...(!isForcedCanonicalSearchChoice(toolChoice) && toolChoice !== undefined
+      ? { tool_choice: toolChoice }
+      : {}),
   };
 };
