@@ -376,6 +376,37 @@ const messagesToInputItems = (
   return items;
 };
 
+const LOOKAROUND_RE = /\(\?[=!]|\(\?<[=!]/;
+
+/**
+ * Deep-walk a JSON-schema value and drop any `pattern` key whose string value
+ * contains a regex lookaround construct (`(?=`, `(?!`, `(?<=`, `(?<!`). The
+ * codex upstream 400s with `Invalid JSON schema: regex lookaround is not
+ * supported. Found at $.properties.contact.properties.email.pattern.` on any
+ * such schema, so tool params carrying one (e.g. an MCP tool validating email
+ * format) must be stripped before forwarding. Pure — never mutates `params`;
+ * a `pattern` key whose value isn't a string (e.g. a user data property
+ * literally named "pattern") is left untouched.
+ */
+export const sanitizeToolParameters = (params: unknown): unknown => {
+  if (Array.isArray(params)) {
+    return params.map((item) => sanitizeToolParameters(item));
+  }
+  if (params === null || typeof params !== "object") return params;
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(params)) {
+    if (
+      key === "pattern" &&
+      typeof value === "string" &&
+      LOOKAROUND_RE.test(value)
+    ) {
+      continue;
+    }
+    result[key] = sanitizeToolParameters(value);
+  }
+  return result;
+};
+
 // runtime-only: a single tool definition in the Responses API. Note
 // the FLAT shape — the chat-completions tool wrapper
 // (`{type:"function", function:{name,...}}`) is not accepted here.
@@ -406,7 +437,7 @@ const toolsToResponses = (
       ? { description: tool.function.description }
       : {}),
     ...(tool.function.parameters !== undefined
-      ? { parameters: tool.function.parameters }
+      ? { parameters: sanitizeToolParameters(tool.function.parameters) }
       : {}),
     ...(tool.function.strict !== undefined
       ? { strict: tool.function.strict }
