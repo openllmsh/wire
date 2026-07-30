@@ -393,18 +393,21 @@ export const sanitizeToolParameters = (params: unknown): unknown => {
     return params.map((item) => sanitizeToolParameters(item));
   }
   if (params === null || typeof params !== "object") return params;
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(params)) {
-    if (
-      key === "pattern" &&
-      typeof value === "string" &&
-      LOOKAROUND_RE.test(value)
-    ) {
-      continue;
-    }
-    result[key] = sanitizeToolParameters(value);
-  }
-  return result;
+  // Build via `fromEntries`, not `result[key] = ...` — a schema property
+  // literally named `__proto__` would otherwise hit the inherited setter
+  // and rewrite the object's prototype instead of becoming an own property.
+  return Object.fromEntries(
+    Object.entries(params)
+      .filter(
+        ([key, value]) =>
+          !(
+            key === "pattern" &&
+            typeof value === "string" &&
+            LOOKAROUND_RE.test(value)
+          ),
+      )
+      .map(([key, value]) => [key, sanitizeToolParameters(value)]),
+  );
 };
 
 // runtime-only: a single tool definition in the Responses API. Note
@@ -443,6 +446,23 @@ const toolsToResponses = (
       ? { strict: tool.function.strict }
       : {}),
   }));
+
+/**
+ * Sanitize the verbatim `responses_tools` passthrough (Codex's original tool
+ * set). Function tools carry a JSON-schema `parameters` and so are subject to
+ * the same lookaround-`pattern` 400 as {@link toolsToResponses} — this is
+ * actually the path real Codex traffic takes. Non-function tools
+ * (`web_search`, `apply_patch`, `image_generation`, `tool_search`, …) must
+ * round-trip byte-identical, since they're opaque and re-emitted as-is.
+ */
+const sanitizeResponsesTools = (
+  tools: ReadonlyArray<TResponsesPassthroughToolDef>,
+): ReadonlyArray<TResponsesPassthroughToolDef> =>
+  tools.map((tool) =>
+    tool.type === "function" && "parameters" in tool
+      ? { ...tool, parameters: sanitizeToolParameters(tool.parameters) }
+      : tool,
+  );
 
 // runtime-only: tool_choice in the Responses API. Mirrors the tools
 // shape — FLAT `{type:"function", name}`, NOT the chat-completions
@@ -551,7 +571,9 @@ export const toChatGptRequest = (
     | ReadonlyArray<TResponsesToolDef | TResponsesPassthroughToolDef>
     | undefined =
     req.responses_tools !== undefined && req.responses_tools.length > 0
-      ? (req.responses_tools as ReadonlyArray<TResponsesPassthroughToolDef>)
+      ? sanitizeResponsesTools(
+          req.responses_tools as ReadonlyArray<TResponsesPassthroughToolDef>,
+        )
       : req.tools !== undefined && req.tools.length > 0
         ? toolsToResponses(req.tools)
         : undefined;
