@@ -9,7 +9,7 @@ import {
   type TReasoningResponsesInput,
 } from "../../adapters/messages/reasoning-signature";
 import { extractMessageText } from "../../lib/canonical/message";
-import { CHATGPT_DEFAULT_INSTRUCTIONS } from "./common";
+import { CHATGPT_DEFAULT_INSTRUCTIONS as chatGptDefaultInstructions } from "./common";
 
 const CHATGPT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 const CHATGPT_NAME_SUB_RE = /[^a-zA-Z0-9_-]/g;
@@ -565,7 +565,7 @@ export const toChatGptRequest = (
   // a floor for a bare client.
   const instructions =
     options.codexInstructions !== false && fromSystem.length === 0
-      ? CHATGPT_DEFAULT_INSTRUCTIONS
+      ? chatGptDefaultInstructions
       : fromSystem;
 
   const input = messagesToInputItems(conversation);
