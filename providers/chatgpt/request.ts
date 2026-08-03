@@ -9,7 +9,7 @@ import {
   type TReasoningResponsesInput,
 } from "../../adapters/messages/reasoning-signature";
 import { extractMessageText } from "../../lib/canonical/message";
-import { applyCodexDefaultInstructions } from "../prompt-prefix";
+import { CHATGPT_DEFAULT_INSTRUCTIONS } from "./common";
 
 const CHATGPT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 const CHATGPT_NAME_SUB_RE = /[^a-zA-Z0-9_-]/g;
@@ -553,13 +553,20 @@ export const toChatGptRequest = (
     req.messages,
   );
 
-  // Codex-preamble floor for bare clients — centralized with every other
-  // system-prompt injection in `../prompt-prefix` (rationale documented
-  // on `applyCodexDefaultInstructions`).
-  const instructions = applyCodexDefaultInstructions(
-    fromSystem,
-    options.codexInstructions,
-  );
+  // Codex identity floor for BARE clients on the ChatGPT/Codex wire. This is
+  // NOT a gateway policy prefix — it is the Codex identity the ChatGPT backend
+  // historically needed. Apply it ONLY when (a) the caller wants it
+  // (`codexInstructions !== false`; `false` suppresses it for xAI Grok) AND
+  // (b) the client sent NO instructions of its own. A real Codex client always
+  // sends its own (newer) preamble — layering ours on top is a DOUBLE preamble
+  // that wastes input every turn and is unnecessary (current models produce
+  // output with no preamble at all — audit 2026-07-14-codex-upstream-wire §6
+  // F10). So we trust the client's instructions verbatim and only add ours as
+  // a floor for a bare client.
+  const instructions =
+    options.codexInstructions !== false && fromSystem.length === 0
+      ? CHATGPT_DEFAULT_INSTRUCTIONS
+      : fromSystem;
 
   const input = messagesToInputItems(conversation);
   // Prefer the verbatim `responses_tools` passthrough (Codex's full original

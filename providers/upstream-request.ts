@@ -13,11 +13,6 @@ import {
 } from "./anthropic/beta-headers";
 import { toAnthropicRequest } from "./anthropic/request";
 import { deriveChatGptSessionId, toChatGptRequest } from "./chatgpt/request";
-import { injectGatewayPromptPrefix } from "./prompt-prefix";
-
-// Re-exported for existing consumers — the definition lives in
-// `./prompt-prefix`.
-export { CLAUDE_CODE_SYSTEM_PREAMBLE } from "./prompt-prefix";
 
 /**
  * The SINGLE recipe for preparing an upstream provider request from an inbound
@@ -214,34 +209,15 @@ export const buildUpstreamBody = (
   stream: boolean | undefined,
   // Codex-preamble injection for the chatgpt wire (see canonicalToUpstreamBody).
   codexInstructions?: boolean,
-  // Marks the genuine Claude Code subscription hop (OAuth Anthropic —
-  // handrolled claude_code). When set, the body is forwarded VERBATIM (no
-  // gateway prefix, no synthetic preamble) — the real CLI already carries
-  // its own identity + the vendor-required first system block. Set by
-  // buildUpstreamRequest from `isOAuth && upstreamWire === "anthropic"`.
-  oauthAnthropicPreamble?: boolean,
 ): unknown => {
-  // The gateway prompt prefix (`GATEWAY_PROMPT_PREFIX` from
-  // `@openllmsh/protocol`) is injected into the upstream body — EXCEPT on
-  // the genuine Claude Code subscription hop (OAuth Anthropic — the
-  // `oauthAnthropicPreamble` flag). That hop only ever serves a real
-  // Claude Code client (every non-CC originator takes the bridge), so its
-  // request already carries the CLI's own identity + system prompt, and
-  // it authenticates AS the Claude Code CLI. Injecting anything of OURS —
-  // the policy prefix (openllm `<provider>/<model>` syntax, `v1/models`,
-  // tier names) OR a synthetic identity preamble — makes the request
-  // self-identify as a multi-provider gateway, exactly the shape
+  // No gateway prompt prefix is injected anywhere. The gateway forwards the
+  // client's system prompt verbatim on EVERY hop — a gateway-injected prefix
+  // both breaks prompt-cache prefix stability (any variance collapses the
+  // shared prefix to a cache rebuild) and, on the subscription OAuth hop,
+  // self-identifies the request as a multi-provider gateway (the shape
   // Anthropic's AUP "reverse engineering / duplicating model outputs"
-  // safeguard blocks. So on that hop we forward the client's body
-  // VERBATIM (the CLI already sends the vendor-required preamble first).
-  // Every other hop — BYOK Anthropic, chatgpt, kimi, openai — still gets
-  // the gateway prefix.
-  const isClaudeCodeSubscriptionHop =
-    oauthAnthropicPreamble === true && upstreamWire === "anthropic";
-  const withClaudePreamble = (upstreamBody: unknown): unknown =>
-    isClaudeCodeSubscriptionHop
-      ? upstreamBody
-      : injectGatewayPromptPrefix(upstreamWire, upstreamBody);
+  // safeguard blocks). Steering prefixes now live ONLY at the CLI/client
+  // level (e.g. the `openllm claude` overlay), never in this chain.
   // Passthrough: same wire in + out (NEVER for `responses` — its body is
   // Responses-shaped). Only the model id + stream flag are pinned. The
   // Anthropic passthrough additionally normalises adaptive-thinking knobs
@@ -268,21 +244,17 @@ export const buildUpstreamBody = (
       ...(providerModelId.length > 0 ? { model: providerModelId } : {}),
       ...(stream !== undefined ? { stream } : {}),
     };
-    return withClaudePreamble(
-      upstreamWire === "anthropic"
-        ? normaliseAdaptiveThinking(hoistInlineAnthropicSystemMessages(pinned))
-        : pinned,
-    );
+    return upstreamWire === "anthropic"
+      ? normaliseAdaptiveThinking(hoistInlineAnthropicSystemMessages(pinned))
+      : pinned;
   }
   // Cross-wire: route through canonical, then encode to the upstream's wire.
-  return withClaudePreamble(
-    canonicalToUpstreamBody(
-      upstreamWire,
-      canonicalFromInbound(surface, rawBody),
-      providerModelId,
-      stream ?? false,
-      codexInstructions,
-    ),
+  return canonicalToUpstreamBody(
+    upstreamWire,
+    canonicalFromInbound(surface, rawBody),
+    providerModelId,
+    stream ?? false,
+    codexInstructions,
   );
 };
 
@@ -448,7 +420,6 @@ export const buildUpstreamRequest = (
     i.providerModelId,
     i.stream,
     i.codexInstructions,
-    (i.isOAuth ?? false) && i.upstreamWire === "anthropic",
   ),
   headers: buildUpstreamHeaders(i),
 });
