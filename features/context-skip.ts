@@ -58,10 +58,17 @@ export const PROVIDER_TOKEN_ESTIMATE_FACTOR: Readonly<Record<string, number>> =
     anthropic: 1.4,
     claude_code: 1.4,
     kimi_code: 1.12,
+    // xAI Grok's tokenizer counts materially more than our o200k ruler. Left at
+    // 1, the daemon's compaction gate measured an oversized body on o200k, saw it
+    // "fit" the 500000 window, and SKIPPED compaction — so the request 400'd
+    // upstream (`maximum prompt length is 500000 ... contains 521105 tokens`).
+    // Conservative seed pending log-derived calibration (as kimi_code/claude_code
+    // were); the window is targeted exactly, so this must sit slightly above the
+    // true xAI/o200k ratio (this incident implies a lower bound of ~1.042).
+    grok: 1.15,
     // OpenAI-family rulers are (near-)exact; no inflation.
     openai: 1,
     chatgpt: 1,
-    grok: 1,
   };
 
 /**
