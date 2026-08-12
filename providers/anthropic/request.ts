@@ -166,7 +166,14 @@ const imageUrlToAnthropicBlock = (
 const filePartToAnthropicBlock = (
   part: Pick<TFilePart, "file">,
 ): TAnthropicContentBlock => {
-  const { file_data, file_id, filename } = part.file;
+  const { file_data, file_id, filename, url } = part.file;
+  if (url !== undefined) {
+    return {
+      type: "document",
+      source: { type: "url", url },
+      ...(filename !== undefined ? { title: filename } : {}),
+    };
+  }
   if (file_data !== undefined) {
     const m = DATA_URL_RE.exec(file_data);
     if (m !== null) {

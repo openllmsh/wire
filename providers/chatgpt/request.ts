@@ -112,6 +112,7 @@ type TResponsesContentPart =
       readonly filename?: string;
       readonly file_data?: string;
       readonly file_id?: string;
+      readonly file_url?: string;
     };
 
 // runtime-only: a single item in the Responses API `input` array.
@@ -168,6 +169,7 @@ const contentToInputParts = (
         ...(block.file.file_id !== undefined
           ? { file_id: block.file.file_id }
           : {}),
+        ...(block.file.url !== undefined ? { file_url: block.file.url } : {}),
       });
     }
   }
