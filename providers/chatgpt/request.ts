@@ -156,20 +156,24 @@ const contentToInputParts = (
           : {}),
       });
     } else if (block.type === "file") {
-      // Responses `input_file.file_data` is a data URL — same encoding
-      // as the canonical file part, so it copies through directly.
+      // Responses `input_file` takes exactly ONE file carrier. Pick a single
+      // one by precedence — a public `url` (clean-context, no bytes) wins,
+      // then a provider `file_id`, then an inline `file_data` data URL — so a
+      // caller that sets more than one can't emit an ambiguous part.
+      const fileCarrier =
+        block.file.url !== undefined
+          ? { file_url: block.file.url }
+          : block.file.file_id !== undefined
+            ? { file_id: block.file.file_id }
+            : block.file.file_data !== undefined
+              ? { file_data: block.file.file_data }
+              : {};
       parts.push({
         type: "input_file",
         ...(block.file.filename !== undefined
           ? { filename: block.file.filename }
           : {}),
-        ...(block.file.file_data !== undefined
-          ? { file_data: block.file.file_data }
-          : {}),
-        ...(block.file.file_id !== undefined
-          ? { file_id: block.file.file_id }
-          : {}),
-        ...(block.file.url !== undefined ? { file_url: block.file.url } : {}),
+        ...fileCarrier,
       });
     }
   }
