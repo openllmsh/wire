@@ -88,6 +88,65 @@ export const compactionTargetFor = (
 };
 
 /**
+ * Single safety margin applied to the vendor-grounded compaction target: aim
+ * the shrunk body at `window × SAFETY` implied vendor tokens, leaving a small
+ * headroom band so the retry clears the real tokenizer even if the ratio drifts
+ * slightly between passes. ONE knob for every provider — the calibration itself
+ * is self-derived from the vendor's own numbers, so there is no per-model
+ * branching here.
+ */
+export const COMPACTION_OVERFLOW_SAFETY = 0.92;
+
+/**
+ * A sane lower bound for any computed compaction target. A pathological vendor
+ * ratio (or a tiny window) must never drive the target to zero / negative — the
+ * cut would then strip the live turn too. 512 tokens comfortably holds the
+ * system prompt + the final user turn the compactor always preserves.
+ */
+export const COMPACTION_TARGET_FLOOR = 512;
+
+/**
+ * Vendor-grounded, self-calibrating compaction target. When the upstream
+ * rejected a body on size it reports two ground-truth numbers: `requiredTokens`
+ * (how many tokens ITS tokenizer counted for the body we sent) and, implicitly,
+ * the `window` it must fit. Our local ruler measured that same body at
+ * `localEstimate`, so the observed ratio `r = requiredTokens / localEstimate`
+ * is exact calibration for THIS conversation's content — no static per-provider
+ * factor needed.
+ *
+ * We return a target in LOCAL ruler space: shrinking the body to
+ * `floor(window / r × SAFETY)` local tokens implies a vendor count of
+ * `<= window × SAFETY`, i.e. inside the window with headroom. The result is
+ * clamped to be no looser than `compactionTargetFor(provider, window)` (the
+ * static target is an upper bound — vendor grounding may only tighten) and never
+ * below `COMPACTION_TARGET_FLOOR`. When the vendor gave no usable count we fall
+ * back to the static target. Generic across grok / chatgpt / anthropic / kimi —
+ * whatever numbers the vendor surfaces drive the cut.
+ */
+export const compactionTargetFromOverflow = (params: {
+  readonly requiredTokens: number | null;
+  readonly window: number;
+  readonly localEstimate: number;
+  readonly provider: string;
+}): number => {
+  const staticTarget = compactionTargetFor(params.provider, params.window);
+  if (
+    params.requiredTokens === null ||
+    params.requiredTokens <= 0 ||
+    params.localEstimate <= 0
+  ) {
+    return staticTarget;
+  }
+  const ratio = params.requiredTokens / params.localEstimate;
+  const vendorGrounded = Math.floor(
+    (params.window / ratio) * COMPACTION_OVERFLOW_SAFETY,
+  );
+  // Vendor-grounded may only TIGHTEN the static target, and never fall below the
+  // floor.
+  return Math.max(COMPACTION_TARGET_FLOOR, Math.min(staticTarget, vendorGrounded));
+};
+
+/**
  * Should this hop be skipped for context? True only when a later hop
  * remains (the FINAL hop always serves — the real tokenizer must get the
  * last word, never the heuristic estimator), the model's input budget is
