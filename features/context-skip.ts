@@ -141,9 +141,13 @@ export const compactionTargetFromOverflow = (params: {
   const vendorGrounded = Math.floor(
     (params.window / ratio) * COMPACTION_OVERFLOW_SAFETY,
   );
-  // Vendor-grounded may only TIGHTEN the static target, and never fall below the
-  // floor.
-  return Math.max(COMPACTION_TARGET_FLOOR, Math.min(staticTarget, vendorGrounded));
+  // Vendor-grounded may only TIGHTEN the static target. The floor is normally
+  // COMPACTION_TARGET_FLOOR, but a small live `context_window` can make the
+  // static target itself dip below that floor — clamping up to 512 would then
+  // return a target LOOSER than the window allows. Cap the floor at the static
+  // target so the result is always `<= staticTarget`.
+  const floor = Math.min(COMPACTION_TARGET_FLOOR, staticTarget);
+  return Math.max(floor, Math.min(staticTarget, vendorGrounded));
 };
 
 /**
