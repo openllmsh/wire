@@ -20,6 +20,7 @@ export * from "./features/quota-gate";
 export * from "./lib/canonical/message";
 export * from "./lib/canonical/token-estimate";
 export * from "./lib/encrypted-content";
+export * from "./lib/thinking-signature";
 export * from "./lib/refusal";
 export * from "./lib/streaming/accumulate";
 export * from "./lib/streaming/peek";
