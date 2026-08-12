@@ -147,6 +147,33 @@ export const compactionTargetFromOverflow = (params: {
 };
 
 /**
+ * Hard cap on last-resort compaction rounds (daemon walker + cloud dispatch
+ * chain). The vendor-grounded ratio converges fast (usually one tighter round
+ * after a static undercorrect), so three rounds is ample headroom; the cap's
+ * real job is to make an infinite compaction loop structurally impossible when
+ * an upstream keeps rejecting. Single source of truth — both seams import this.
+ */
+export const MAX_LAST_RESORT_COMPACTION_ROUNDS = 3;
+
+/**
+ * A confirmed overflow always forces a real shrink. If the calibrated target
+ * is already below the current local estimate, use it; otherwise tighten below
+ * the current body (`localEstimate × SAFETY`, floored) so the cut is never a
+ * no-op re-send of the same bytes. Shared by the daemon walker and the cloud
+ * dispatch chain so the force-shrink math cannot drift between them.
+ */
+export const forcedCompactionTarget = (
+  calibrated: number,
+  localEstimate: number,
+): number =>
+  calibrated < localEstimate
+    ? calibrated
+    : Math.max(
+        COMPACTION_TARGET_FLOOR,
+        Math.floor(localEstimate * COMPACTION_OVERFLOW_SAFETY),
+      );
+
+/**
  * Should this hop be skipped for context? True only when a later hop
  * remains (the FINAL hop always serves — the real tokenizer must get the
  * last word, never the heuristic estimator), the model's input budget is
