@@ -146,21 +146,25 @@ export const toAnthropicMessagesResponse = (
   }
 
   // Claude Code `/compact` requires a non-empty user-visible `text`
-  // block for thinking-only replies. Do not clone a signed thought that
-  // was already stripped as a content restatement (same rule as the
-  // streaming adapter).
+  // block for thinking-only replies. Never clone a signed summary
+  // (second ⏺). Pad with the placeholder only when the thinking
+  // block has no human summary. Unsigned leftover (Kimi) is the
+  // only visible channel and still becomes text. Same rule as the
+  // streaming adapter.
   const restatedSignedThought =
     reasoningSignature !== null && text.length > 0 && answerText.length === 0;
   if (!content.some((b) => b.type === "text") && !restatedSignedThought) {
-    if (reasoning.length > 0) {
+    if (reasoningSignature !== null) {
+      if (reasoning.length === 0) {
+        content.push({
+          type: "text",
+          text: ensureCompactionSafeVisibleText(REASONING_PLACEHOLDER_TEXT),
+        });
+      }
+    } else if (reasoning.length > 0) {
       content.push({
         type: "text",
         text: ensureCompactionSafeVisibleText(reasoning),
-      });
-    } else if (reasoningSignature !== null) {
-      content.push({
-        type: "text",
-        text: ensureCompactionSafeVisibleText(REASONING_PLACEHOLDER_TEXT),
       });
     }
   }

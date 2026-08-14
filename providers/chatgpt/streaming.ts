@@ -530,8 +530,14 @@ export const chatGptEventToChunk = (
     };
   }
 
-  if (type === "response.reasoning_summary_text.delta") {
-    const delta = stringField(event, "delta");
+  if (
+    type === "response.reasoning_summary_text.delta" ||
+    type === "response.reasoning_summary_text.done"
+  ) {
+    const delta =
+      type === "response.reasoning_summary_text.done"
+        ? (stringField(event, "text") ?? stringField(event, "delta"))
+        : stringField(event, "delta");
     if (delta === undefined || delta.length === 0) return null;
     return {
       ...baseChunk(options),

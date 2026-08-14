@@ -16,13 +16,7 @@ import {
   reasoningItemsFromUnknown,
 } from "./reasoning-signature";
 
-/**
- * Growing snapshots re-send the full prefix each chunk. Tail-only is
- * safe once the overlap is longer than a token (`"The"` + `"There"`
- * must still concatenate). Field sample: mid-word flush then the
- * completed sentence replayed as one chunk.
- */
-const GROWING_SNAPSHOT_MIN = 32;
+type TDeltaFoldMode = "incremental" | "snapshot";
 
 // runtime-only: stateful translation buffer.
 export type TMessagesStreamState = {
@@ -158,25 +152,31 @@ export const newMessagesStreamState = (): TMessagesStreamState => ({
 /**
  * Dedup / accumulate a text-bearing delta.
  *
- * Identical `incoming === accumulated` is always a same-snapshot repeat
- * (the screenshot: complete `S` every chunk) and is skipped.
+ * Mode is channel identity, not string shape: `"The"` + `"There"` and a
+ * growing snapshot that happens to start with the accumulated prefix are
+ * the same `startsWith` condition. Incremental tokens (Kimi
+ * `reasoning_content`, unmarked `delta.content`) always append.
+ * Responses summaries (`reasoning_items` present, including `[]`)
+ * replay the full prefix — emit only the tail.
  *
- * Incremental streams (unsigned `reasoning_content`, `delta.content`)
- * must APPEND even when a *short* new chunk starts with the accumulated
- * text (`"The"` then `"There"` → `"TheThere"`, not `"There"`). A long
- * growing snapshot (full prefix replayed each chunk) emits only the tail.
+ * Identical `incoming === accumulated` is always a same-snapshot repeat
+ * and is skipped in both modes.
  */
-const snapshotOrIncremental = (
+const foldDelta = (
   incoming: string,
   accumulated: string,
+  mode: TDeltaFoldMode,
 ): { readonly next: string; readonly emit: string } => {
   if (incoming.length === 0) return { next: accumulated, emit: "" };
   if (incoming === accumulated) return { next: accumulated, emit: "" };
-  if (
-    accumulated.length >= GROWING_SNAPSHOT_MIN &&
-    incoming.startsWith(accumulated)
-  ) {
-    return { next: incoming, emit: incoming.slice(accumulated.length) };
+  if (mode === "snapshot") {
+    if (incoming.startsWith(accumulated)) {
+      return { next: incoming, emit: incoming.slice(accumulated.length) };
+    }
+    if (accumulated.startsWith(incoming)) {
+      return { next: accumulated, emit: "" };
+    }
+    return { next: incoming, emit: incoming };
   }
   return { next: accumulated + incoming, emit: incoming };
 };
@@ -465,9 +465,10 @@ export const chunkToMessagesEvents = (
     // a signature-less thinking block on replay. Signed Responses hops
     // (Grok / Codex) hold the same text for the thinking block opened
     // by `emitReasoningSignature`; dumping it first is the double ⏺.
-    const reasoningSnap = snapshotOrIncremental(
+    const reasoningSnap = foldDelta(
       deltaReasoning,
       state.thinkingAccumulated,
+      state.signedReasoningChannel ? "snapshot" : "incremental",
     );
     state.thinkingAccumulated = reasoningSnap.next;
     if (
@@ -562,14 +563,15 @@ export const chunkToMessagesEvents = (
   }
 
   // Text delta → open text block (if not already) + content_block_delta.
-  // Exact-snapshot / long growing-prefix dedup against the content-only
+  // Content is incremental: exact-match skip, else append. A dedicated
   // ledger so dumped reasoning cannot swallow a later answer prefix.
   // Signed hops also drop content that merely restates the thought
   // (field sample: same sentence as a second ⏺ after "Thought for 1s").
   if (deltaText !== null && deltaText !== undefined && deltaText.length > 0) {
-    const textSnap = snapshotOrIncremental(
+    const textSnap = foldDelta(
       deltaText,
       state.contentSnapshotAccumulated,
+      "incremental",
     );
     state.contentSnapshotAccumulated = textSnap.next;
     let emit = textSnap.emit;
