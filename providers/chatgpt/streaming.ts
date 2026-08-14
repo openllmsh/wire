@@ -538,7 +538,15 @@ export const chatGptEventToChunk = (
       choices: [
         {
           index: 0,
-          delta: { reasoning_content: delta },
+          delta: {
+            reasoning_content: delta,
+            // Empty array is the signed-channel marker (not a
+            // reasoning item). The messages adapter holds this
+            // summary for a thinking block instead of dumping it
+            // as a visible ⏺ prompt. Kimi-style hops never set
+            // this field and still dump unsigned reasoning as text.
+            reasoning_items: [],
+          },
           finish_reason: null,
         },
       ],

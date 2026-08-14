@@ -5,6 +5,11 @@ import type {
 import { ensureCompactionSafeVisibleText } from "../../features/compaction/compaction-text";
 import { encodeSseEvent } from "../../lib/streaming/sse";
 import { upstreamErrorFrom } from "../../lib/streaming/upstream-error";
+import {
+  anthropicStopReasonFrom,
+  REASONING_PLACEHOLDER_TEXT,
+  visibleAnswerAfterThought,
+} from "./anthropic-map";
 import { plainTextFromReasoningItems } from "./reasoning-from-items";
 import {
   encodeReasoningSignature,
@@ -12,29 +17,12 @@ import {
 } from "./reasoning-signature";
 
 /**
- * Shown as the (collapsed) thinking text when an upstream reasoning
- * item carries resumable `encrypted_content` but no human summary. The
- * block still needs *some* text for clients that reject an empty
- * `thinking` — the value that matters is the `signature` we attach.
+ * Growing snapshots re-send the full prefix each chunk. Tail-only is
+ * safe once the overlap is longer than a token (`"The"` + `"There"`
+ * must still concatenate). Field sample: mid-word flush then the
+ * completed sentence replayed as one chunk.
  */
-const REASONING_PLACEHOLDER_TEXT = "[reasoning]";
-
-const stopReasonFor = (
-  finish: TChatCompletionChunk["choices"][number]["finish_reason"],
-): "end_turn" | "max_tokens" | "tool_use" | "refusal" | null => {
-  if (finish === null || finish === undefined) return null;
-  switch (finish) {
-    case "stop":
-      return "end_turn";
-    case "length":
-      return "max_tokens";
-    case "tool_calls":
-    case "function_call":
-      return "tool_use";
-    case "content_filter":
-      return "refusal";
-  }
-};
+const GROWING_SNAPSHOT_MIN = 32;
 
 // runtime-only: stateful translation buffer.
 export type TMessagesStreamState = {
@@ -79,7 +67,7 @@ export type TMessagesStreamState = {
   openToolContentIndexes: Set<number>;
   /** Next free Anthropic content_index. */
   nextContentIndex: number;
-  finalStopReason: ReturnType<typeof stopReasonFor>;
+  finalStopReason: ReturnType<typeof anthropicStopReasonFrom>;
   /**
    * Concatenation of all `reasoning_content` / thinking deltas. On
    * terminal chunk, if there was no non-empty `text_delta`, we mirror
@@ -121,8 +109,16 @@ export type TMessagesStreamState = {
    * the model loses chain-of-thought state and loops forever.
    */
   pendingReasoningSignature: string | null;
-  /** True once `signature_delta` has been emitted (emit exactly once). */
-  reasoningSignatureEmitted: boolean;
+  /**
+   * Responses hops (Grok / Codex) tag summary deltas with
+   * `reasoning_items: []` (and later a real encrypted item). The
+   * summary must ride a signed `thinking` block — dumping it as
+   * visible `text` and then opening a placeholder thinking block
+   * produces two identical ⏺ prompts around "Thought for 1s".
+   */
+  signedReasoningChannel: boolean;
+  /** True after a signed thinking block was sealed this turn. */
+  sealedSignedThinking: boolean;
   /** Provider-executed hosted searches emitted so far — drives the terminal
    *  `message_delta.usage.server_tool_use.web_search_requests`. */
   serverSearchCount: number;
@@ -154,7 +150,8 @@ export const newMessagesStreamState = (): TMessagesStreamState => ({
   lastChunkHadProviderUsage: false,
   thinkingDeltaEmittedLen: 0,
   pendingReasoningSignature: null,
-  reasoningSignatureEmitted: false,
+  signedReasoningChannel: false,
+  sealedSignedThinking: false,
   serverSearchCount: 0,
 });
 
@@ -165,10 +162,9 @@ export const newMessagesStreamState = (): TMessagesStreamState => ({
  * (the screenshot: complete `S` every chunk) and is skipped.
  *
  * Incremental streams (unsigned `reasoning_content`, `delta.content`)
- * must APPEND even when the new chunk happens to start with the
- * accumulated text (`"The"` then `"There"` → `"TheThere"`, not
- * `"There"`). Growing snapshots (`reasoning_items`) already have their
- * own `startsWith` path and never go through this helper.
+ * must APPEND even when a *short* new chunk starts with the accumulated
+ * text (`"The"` then `"There"` → `"TheThere"`, not `"There"`). A long
+ * growing snapshot (full prefix replayed each chunk) emits only the tail.
  */
 const snapshotOrIncremental = (
   incoming: string,
@@ -176,16 +172,24 @@ const snapshotOrIncremental = (
 ): { readonly next: string; readonly emit: string } => {
   if (incoming.length === 0) return { next: accumulated, emit: "" };
   if (incoming === accumulated) return { next: accumulated, emit: "" };
+  if (
+    accumulated.length >= GROWING_SNAPSHOT_MIN &&
+    incoming.startsWith(accumulated)
+  ) {
+    return { next: incoming, emit: incoming.slice(accumulated.length) };
+  }
   return { next: accumulated + incoming, emit: incoming };
 };
 
 /**
- * Emit the reasoning `signature_delta` onto the (still-open) thinking
- * block so Claude Code replays it verbatim next turn. Anthropic
- * requires `signature_delta` to be the thinking block's LAST delta,
- * before `content_block_stop` and before any tool_use block opens — so
- * this runs the moment `reasoning_items` arrive (Codex sends them on
- * the reasoning item's `output_item.done`, ahead of the function call).
+ * Emit the reasoning `signature_delta` onto the thinking block so
+ * Claude Code replays it verbatim next turn. Anthropic requires
+ * `signature_delta` to be the thinking block's LAST delta, before
+ * `content_block_stop` and before any tool_use block opens — so this
+ * runs the moment encrypted `reasoning_items` arrive (Codex/Grok send
+ * them on the reasoning item's `output_item.done`, ahead of the
+ * function call). The human-readable summary rides the same thinking
+ * block; dumping it as `text` first is what produced the double ⏺.
  */
 const emitReasoningSignature = (
   state: TMessagesStreamState,
@@ -193,37 +197,39 @@ const emitReasoningSignature = (
 ): void => {
   if (
     state.pendingReasoningSignature === null ||
-    state.reasoningSignatureEmitted ||
     state.openToolContentIndexes.size > 0
   ) {
     return;
   }
-  if (!state.thinkingBlockOpen) {
-    // The signed thinking block carries ONLY the Codex/Responses
-    // chain-of-thought STATE (opaque signature). Human-readable
-    // reasoning is streamed separately as visible `text`. Close any
-    // open text / tool block first so content blocks stay strictly
-    // sequential (Anthropic rejects overlapping blocks).
-    closeTextBlock(state, out);
-    closeAllToolBlocks(state, out);
-    const idx = openThinkingBlock(state, out);
+  closeTextBlock(state, out);
+  closeAllToolBlocks(state, out);
+  const idx = openThinkingBlock(state, out);
+  const held = state.thinkingAccumulated.slice(state.thinkingDeltaEmittedLen);
+  const thinkingText =
+    held.length > 0
+      ? held
+      : state.thinkingAccumulated.length === 0
+        ? REASONING_PLACEHOLDER_TEXT
+        : "";
+  if (thinkingText.length > 0) {
     out.push({
       type: "content_block_delta",
       index: idx,
-      delta: { type: "thinking_delta", thinking: REASONING_PLACEHOLDER_TEXT },
+      delta: { type: "thinking_delta", thinking: thinkingText },
     });
+    state.thinkingDeltaEmittedLen = state.thinkingAccumulated.length;
   }
-  if (state.thinkingBlockIndex !== null) {
-    out.push({
-      type: "content_block_delta",
-      index: state.thinkingBlockIndex,
-      delta: {
-        type: "signature_delta",
-        signature: state.pendingReasoningSignature,
-      },
-    });
-    state.reasoningSignatureEmitted = true;
-  }
+  out.push({
+    type: "content_block_delta",
+    index: idx,
+    delta: {
+      type: "signature_delta",
+      signature: state.pendingReasoningSignature,
+    },
+  });
+  state.pendingReasoningSignature = null;
+  state.sealedSignedThinking = true;
+  closeThinkingBlock(state, out);
 };
 
 const closeThinkingBlock = (
@@ -243,7 +249,10 @@ const openThinkingBlock = (
   state: TMessagesStreamState,
   out: TAnthropicStreamEvent[],
 ): number => {
-  if (state.thinkingBlockIndex === null) {
+  // A stopped thinking index must not be reopened (Anthropic indices
+  // are unique + monotonic). A later reasoning item (Grok interleaves
+  // summaries with tool calls) gets a fresh block.
+  if (state.thinkingBlockIndex === null || !state.thinkingBlockOpen) {
     state.thinkingBlockIndex = state.nextContentIndex;
     state.nextContentIndex += 1;
   }
@@ -383,6 +392,22 @@ const openTextBlock = (
   return state.textBlockIndex;
 };
 
+const emitVisibleText = (
+  state: TMessagesStreamState,
+  out: TAnthropicStreamEvent[],
+  text: string,
+): void => {
+  if (text.length === 0) return;
+  const idx = openTextBlock(state, out);
+  out.push({
+    type: "content_block_delta",
+    index: idx,
+    delta: { type: "text_delta", text },
+  });
+  state.emittedNonemptyTextDelta = true;
+  state.textAccumulated += text;
+};
+
 /**
  * Translate one OpenAI ChatCompletion chunk into zero or more
  * Anthropic SSE events. Handles both text deltas and tool_call deltas:
@@ -419,23 +444,27 @@ export const chunkToMessagesEvents = (
   const deltaText = choice?.delta.content ?? null;
   const deltaToolCalls = choice?.delta.tool_calls ?? null;
 
+  // Responses hops tag summary deltas with `reasoning_items` (empty
+  // array = channel marker; later chunks carry the encrypted item).
+  // Sticky: once we know the hop is signed, later unsigned-looking
+  // fragments stay on the thinking ledger.
+  if (
+    choice?.delta.reasoning_items !== undefined &&
+    choice.delta.reasoning_items !== null
+  ) {
+    state.signedReasoningChannel = true;
+  }
+
   if (
     deltaReasoning !== null &&
     deltaReasoning !== undefined &&
     deltaReasoning.length > 0
   ) {
-    // Reasoning text WITHOUT a replay-safe signature must be visible
-    // `text`, never a `thinking` block. Anthropic hard-rejects a
-    // signature-less thinking block the moment Claude Code replays the
-    // assistant turn (`thinking.signature: Field required`), which
-    // triggers a client retry storm and breaks prompt-cache reuse —
-    // draining the user's subscription. The Codex/Responses
-    // chain-of-thought STATE still rides the signed thinking block
-    // opened by `emitReasoningSignature`. `thinkingAccumulated` /
-    // `thinkingDeltaEmittedLen` stay as the reasoning-dedup ledger
-    // shared with the `reasoning_items` snapshot path below.
-    // Same complete `S` every chunk must not become `S×N`. These
-    // hops are incremental unless identified as snapshot streams.
+    // Unsigned reasoning (Kimi / DashScope) has no replay-safe
+    // signature, so it must be visible `text` — Anthropic hard-rejects
+    // a signature-less thinking block on replay. Signed Responses hops
+    // (Grok / Codex) hold the same text for the thinking block opened
+    // by `emitReasoningSignature`; dumping it first is the double ⏺.
     const reasoningSnap = snapshotOrIncremental(
       deltaReasoning,
       state.thinkingAccumulated,
@@ -443,17 +472,11 @@ export const chunkToMessagesEvents = (
     state.thinkingAccumulated = reasoningSnap.next;
     if (
       reasoningSnap.emit.length > 0 &&
-      state.openToolContentIndexes.size === 0
+      state.openToolContentIndexes.size === 0 &&
+      !state.signedReasoningChannel
     ) {
-      const idx = openTextBlock(state, out);
-      out.push({
-        type: "content_block_delta",
-        index: idx,
-        delta: { type: "text_delta", text: reasoningSnap.emit },
-      });
+      emitVisibleText(state, out, reasoningSnap.emit);
       state.thinkingDeltaEmittedLen = state.thinkingAccumulated.length;
-      state.emittedNonemptyTextDelta = true;
-      state.textAccumulated += reasoningSnap.emit;
     }
   }
 
@@ -468,32 +491,15 @@ export const chunkToMessagesEvents = (
   const fromReasoningItems = plainTextFromReasoningItems(
     choice?.delta.reasoning_items,
   );
-  // The `reasoning_items` snapshot carries the same human-readable
-  // summary as the `reasoning_content` deltas, just delivered as a
-  // growing snapshot. Emit only the clean tail beyond what was already
-  // streamed (as visible `text`, same rule as above). A divergent
-  // snapshot (not a superset of what we already sent) is ignored rather
-  // than re-emitted — we cannot retract already-streamed text, and the
-  // `reasoning_content` deltas already conveyed it.
+  // Growing `reasoning_items` snapshot of the same summary. Fold the
+  // tail into the ledger. Do not dump as `text` here — signed hops
+  // emit it as `thinking_delta` with the signature; unsigned hops
+  // flush at content / finish (compaction-safe).
   if (
     fromReasoningItems.length > state.thinkingAccumulated.length &&
     fromReasoningItems.startsWith(state.thinkingAccumulated)
   ) {
     state.thinkingAccumulated = fromReasoningItems;
-    const itemsTail = state.thinkingAccumulated.slice(
-      state.thinkingDeltaEmittedLen,
-    );
-    if (itemsTail.length > 0 && state.openToolContentIndexes.size === 0) {
-      const idx = openTextBlock(state, out);
-      out.push({
-        type: "content_block_delta",
-        index: idx,
-        delta: { type: "text_delta", text: itemsTail },
-      });
-      state.thinkingDeltaEmittedLen = state.thinkingAccumulated.length;
-      state.emittedNonemptyTextDelta = true;
-      state.textAccumulated += itemsTail;
-    }
   }
 
   // Reasoning state arrived (Codex `reasoning` item completed) — seal it
@@ -556,25 +562,31 @@ export const chunkToMessagesEvents = (
   }
 
   // Text delta → open text block (if not already) + content_block_delta.
-  // Exact-snapshot dedup against the content-only ledger so dumped
-  // reasoning cannot swallow a later answer prefix, and incremental
-  // chunks that happen to start with the accumulated text still append.
+  // Exact-snapshot / long growing-prefix dedup against the content-only
+  // ledger so dumped reasoning cannot swallow a later answer prefix.
+  // Signed hops also drop content that merely restates the thought
+  // (field sample: same sentence as a second ⏺ after "Thought for 1s").
   if (deltaText !== null && deltaText !== undefined && deltaText.length > 0) {
     const textSnap = snapshotOrIncremental(
       deltaText,
       state.contentSnapshotAccumulated,
     );
-    if (textSnap.emit.length > 0) {
-      const idx = openTextBlock(state, out);
-      out.push({
-        type: "content_block_delta",
-        index: idx,
-        delta: { type: "text_delta", text: textSnap.emit },
-      });
-      state.emittedNonemptyTextDelta = true;
-      state.contentSnapshotAccumulated = textSnap.next;
-      state.textAccumulated += textSnap.emit;
+    state.contentSnapshotAccumulated = textSnap.next;
+    let emit = textSnap.emit;
+    if (state.signedReasoningChannel && state.thinkingAccumulated.length > 0) {
+      const desired = visibleAnswerAfterThought(
+        state.contentSnapshotAccumulated,
+        state.thinkingAccumulated,
+      );
+      if (desired.startsWith(state.textAccumulated)) {
+        emit = desired.slice(state.textAccumulated.length);
+      } else if (state.textAccumulated.startsWith(desired)) {
+        emit = "";
+      } else {
+        emit = desired;
+      }
     }
+    emitVisibleText(state, out, emit);
   }
 
   // Tool-call deltas → open tool_use blocks + input_json_delta events.
@@ -662,7 +674,7 @@ export const chunkToMessagesEvents = (
   }
 
   if (choice?.finish_reason !== null && choice?.finish_reason !== undefined) {
-    let finalStopReason = stopReasonFor(choice.finish_reason);
+    let finalStopReason = anthropicStopReasonFrom(choice.finish_reason);
     // A tool call whose name only arrived on the terminal event (or never
     // streamed a `content_block_start` because its name stayed empty until
     // now) is opened + closed here so a named-but-unopened `Task`/`Agent`
@@ -704,31 +716,30 @@ export const chunkToMessagesEvents = (
     const deferredReasoning = state.thinkingAccumulated.slice(
       state.thinkingDeltaEmittedLen,
     );
-    if (deferredReasoning.length > 0) {
-      const idx = openTextBlock(state, out);
-      out.push({
-        type: "content_block_delta",
-        index: idx,
-        delta: { type: "text_delta", text: deferredReasoning },
-      });
+    // Unsigned leftover (Kimi / items without encrypted_content) still
+    // becomes visible text. Leftover on a sealed signed hop is more
+    // summary after the thinking block closed — dumping it is the
+    // "polished answer, then the thought again" field sample.
+    if (deferredReasoning.length > 0 && !state.sealedSignedThinking) {
+      emitVisibleText(
+        state,
+        out,
+        ensureCompactionSafeVisibleText(deferredReasoning),
+      );
       state.thinkingDeltaEmittedLen = state.thinkingAccumulated.length;
-      state.emittedNonemptyTextDelta = true;
-      state.textAccumulated += deferredReasoning;
       closeTextBlock(state, out);
-    }
-    if (
+    } else if (
       !state.emittedNonemptyTextDelta &&
-      state.thinkingAccumulated.length > 0
+      state.sealedSignedThinking &&
+      state.thinkingAccumulated.length === 0
     ) {
-      const idx = openTextBlock(state, out);
-      out.push({
-        type: "content_block_delta",
-        index: idx,
-        delta: {
-          type: "text_delta",
-          text: ensureCompactionSafeVisibleText(state.thinkingAccumulated),
-        },
-      });
+      // Signed thinking with no human summary still needs a compact-safe
+      // text block. Do not clone a non-empty sealed summary (second ⏺).
+      emitVisibleText(
+        state,
+        out,
+        ensureCompactionSafeVisibleText(REASONING_PLACEHOLDER_TEXT),
+      );
       closeTextBlock(state, out);
     }
 

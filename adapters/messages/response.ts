@@ -1,37 +1,21 @@
 import type {
   TAnthropicContentBlock,
   TAnthropicResponse,
-  TAnthropicStopReason,
   TChatCompletionResponse,
   TToolCall,
 } from "@openllmsh/protocol";
 import { ensureCompactionSafeVisibleText } from "../../features/compaction/compaction-text";
 import { parseToolArguments } from "../../lib/canonical/message";
+import {
+  anthropicStopReasonFrom,
+  REASONING_PLACEHOLDER_TEXT,
+  visibleAnswerAfterThought,
+} from "./anthropic-map";
 import { plainTextFromReasoningItems } from "./reasoning-from-items";
 import {
   encodeReasoningSignature,
   reasoningItemsFromUnknown,
 } from "./reasoning-signature";
-
-/** Mirrors the streaming adapter's empty-summary thinking placeholder. */
-const REASONING_PLACEHOLDER_TEXT = "[reasoning]";
-
-const toAnthropicStopReason = (
-  finish: TChatCompletionResponse["choices"][number]["finish_reason"],
-): TAnthropicStopReason | null => {
-  if (finish === null) return null;
-  switch (finish) {
-    case "stop":
-      return "end_turn";
-    case "length":
-      return "max_tokens";
-    case "tool_calls":
-    case "function_call":
-      return "tool_use";
-    case "content_filter":
-      return "refusal";
-  }
-};
 
 const extractText = (
   content: TChatCompletionResponse["choices"][number]["message"]["content"],
@@ -78,7 +62,7 @@ export const toAnthropicMessagesResponse = (
   const reasoning =
     reasoningFromMessage.length > 0 ? reasoningFromMessage : reasoningFromItems;
   const stopReason =
-    choice !== undefined ? toAnthropicStopReason(choice.finish_reason) : null;
+    choice !== undefined ? anthropicStopReasonFrom(choice.finish_reason) : null;
 
   // Round-trip the upstream `reasoning` item(s) (Codex/Responses
   // `encrypted_content`) through the thinking block's opaque
@@ -138,9 +122,15 @@ export const toAnthropicMessagesResponse = (
   }
   const visibleReasoning =
     reasoningSignature === null && reasoning.length > 0 ? reasoning : "";
-  if (text.length > 0) {
+  const answerText =
+    reasoningSignature !== null && reasoning.length > 0
+      ? visibleAnswerAfterThought(text, reasoning)
+      : text;
+  if (answerText.length > 0) {
     const body =
-      visibleReasoning.length > 0 ? `${visibleReasoning}\n\n${text}` : text;
+      visibleReasoning.length > 0
+        ? `${visibleReasoning}\n\n${answerText}`
+        : answerText;
     content.push({
       type: "text",
       text: ensureCompactionSafeVisibleText(body),
@@ -156,16 +146,23 @@ export const toAnthropicMessagesResponse = (
   }
 
   // Claude Code `/compact` requires a non-empty user-visible `text`
-  // block for “conversation summary” responses. A Codex reply that
-  // filled ONLY the signed `thinking` block (no `text`) would otherwise
-  // fail with “did not contain valid text content”. Tool-only (or
-  // other) replies with no reasoning must not synthesize the compaction
-  // fallback as visible assistant text.
-  if (!content.some((b) => b.type === "text") && reasoning.length > 0) {
-    content.push({
-      type: "text",
-      text: ensureCompactionSafeVisibleText(reasoning),
-    });
+  // block for thinking-only replies. Do not clone a signed thought that
+  // was already stripped as a content restatement (same rule as the
+  // streaming adapter).
+  const restatedSignedThought =
+    reasoningSignature !== null && text.length > 0 && answerText.length === 0;
+  if (!content.some((b) => b.type === "text") && !restatedSignedThought) {
+    if (reasoning.length > 0) {
+      content.push({
+        type: "text",
+        text: ensureCompactionSafeVisibleText(reasoning),
+      });
+    } else if (reasoningSignature !== null) {
+      content.push({
+        type: "text",
+        text: ensureCompactionSafeVisibleText(REASONING_PLACEHOLDER_TEXT),
+      });
+    }
   }
 
   const cached = resp.usage.prompt_tokens_details?.cached_tokens ?? 0;
