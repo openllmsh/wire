@@ -42,6 +42,14 @@ export type TMessagesStreamState = {
   messageId: string;
   model: string;
   inputTokens: number;
+  /**
+   * Last-seen `usage.completion_tokens`. The synthetic EOF tail
+   * carries no provider usage of its own; without this, a clean
+   * `end_turn` terminal `message_delta` would reconcile to
+   * `output_tokens: 0` and last-win the live trailer (Claude Code
+   * treats `0` as authoritative, unlike input which is `> 0`-guarded).
+   */
+  outputTokens: number;
   cacheReadTokens: number;
   cacheCreationTokens: number;
   /** Anthropic content_index for the text block. null = not yet opened. */
@@ -125,6 +133,7 @@ export const newMessagesStreamState = (): TMessagesStreamState => ({
   messageId: "",
   model: "",
   inputTokens: 0,
+  outputTokens: 0,
   cacheReadTokens: 0,
   cacheCreationTokens: 0,
   textBlockIndex: null,
@@ -155,31 +164,18 @@ export const newMessagesStreamState = (): TMessagesStreamState => ({
  * Identical `incoming === accumulated` is always a same-snapshot repeat
  * (the screenshot: complete `S` every chunk) and is skipped.
  *
- * Tail-only / shorter-prefix handling is snapshot-only. Incremental
- * streams (unsigned `reasoning_content`, `delta.content`) must APPEND
- * even when the new chunk happens to start with the accumulated text
- * (`"The"` then `"There"` → `"TheThere"`, not `"There"`). Growing
- * snapshots (`reasoning_items`) already have their own `startsWith`
- * path; pass `asSnapshot` only for an identified snapshot stream.
+ * Incremental streams (unsigned `reasoning_content`, `delta.content`)
+ * must APPEND even when the new chunk happens to start with the
+ * accumulated text (`"The"` then `"There"` → `"TheThere"`, not
+ * `"There"`). Growing snapshots (`reasoning_items`) already have their
+ * own `startsWith` path and never go through this helper.
  */
 const snapshotOrIncremental = (
   incoming: string,
   accumulated: string,
-  asSnapshot = false,
 ): { readonly next: string; readonly emit: string } => {
   if (incoming.length === 0) return { next: accumulated, emit: "" };
   if (incoming === accumulated) return { next: accumulated, emit: "" };
-  if (asSnapshot) {
-    if (
-      accumulated.startsWith(incoming) &&
-      incoming.length < accumulated.length
-    ) {
-      return { next: accumulated, emit: "" };
-    }
-    if (incoming.startsWith(accumulated)) {
-      return { next: incoming, emit: incoming.slice(accumulated.length) };
-    }
-  }
   return { next: accumulated + incoming, emit: incoming };
 };
 
@@ -626,6 +622,7 @@ export const chunkToMessagesEvents = (
     chunk.usage != null && chunk.usage.prompt_tokens > 0;
   if (chunk.usage != null) {
     state.inputTokens = chunk.usage.prompt_tokens;
+    state.outputTokens = chunk.usage.completion_tokens;
     state.cacheReadTokens =
       chunk.usage.prompt_tokens_details?.cached_tokens ?? 0;
     state.cacheCreationTokens =
@@ -735,7 +732,7 @@ export const chunkToMessagesEvents = (
       closeTextBlock(state, out);
     }
 
-    const outputTokens = chunk.usage?.completion_tokens ?? 0;
+    const outputTokens = chunk.usage?.completion_tokens ?? state.outputTokens;
     out.push({
       type: "message_delta",
       delta: {
@@ -852,6 +849,15 @@ export const chunksToMessagesSseBytes = (
                   object: "chat.completion.chunk",
                   created: Math.floor(Date.now() / 1000),
                   model: state.model !== "" ? state.model : "unknown",
+                  // The trailer was already consumed; fold last-seen
+                  // usage onto this finish chunk so the terminal
+                  // `message_delta` reconciles to the provider totals
+                  // instead of `output_tokens: 0`.
+                  usage: {
+                    prompt_tokens: state.inputTokens,
+                    completion_tokens: state.outputTokens,
+                    total_tokens: state.inputTokens + state.outputTokens,
+                  },
                   choices: [
                     {
                       index: 0,
