@@ -150,26 +150,35 @@ export const newMessagesStreamState = (): TMessagesStreamState => ({
 });
 
 /**
- * OpenAI-compat hops mix incremental deltas and same/growing snapshots
- * on `content` and `reasoning_content`. Emit only the new tail when
- * `incoming` is a prefix-superset of what we already have; ignore a
- * shorter or identical snapshot; otherwise append as an incremental
- * delta. Same rule as the `reasoning_items` `startsWith` path.
+ * Dedup / accumulate a text-bearing delta.
+ *
+ * Identical `incoming === accumulated` is always a same-snapshot repeat
+ * (the screenshot: complete `S` every chunk) and is skipped.
+ *
+ * Tail-only / shorter-prefix handling is snapshot-only. Incremental
+ * streams (unsigned `reasoning_content`, `delta.content`) must APPEND
+ * even when the new chunk happens to start with the accumulated text
+ * (`"The"` then `"There"` → `"TheThere"`, not `"There"`). Growing
+ * snapshots (`reasoning_items`) already have their own `startsWith`
+ * path; pass `asSnapshot` only for an identified snapshot stream.
  */
 const snapshotOrIncremental = (
   incoming: string,
   accumulated: string,
+  asSnapshot = false,
 ): { readonly next: string; readonly emit: string } => {
   if (incoming.length === 0) return { next: accumulated, emit: "" };
   if (incoming === accumulated) return { next: accumulated, emit: "" };
-  if (
-    accumulated.startsWith(incoming) &&
-    incoming.length < accumulated.length
-  ) {
-    return { next: accumulated, emit: "" };
-  }
-  if (incoming.startsWith(accumulated)) {
-    return { next: incoming, emit: incoming.slice(accumulated.length) };
+  if (asSnapshot) {
+    if (
+      accumulated.startsWith(incoming) &&
+      incoming.length < accumulated.length
+    ) {
+      return { next: accumulated, emit: "" };
+    }
+    if (incoming.startsWith(accumulated)) {
+      return { next: incoming, emit: incoming.slice(accumulated.length) };
+    }
   }
   return { next: accumulated + incoming, emit: incoming };
 };
@@ -429,8 +438,8 @@ export const chunkToMessagesEvents = (
     // opened by `emitReasoningSignature`. `thinkingAccumulated` /
     // `thinkingDeltaEmittedLen` stay as the reasoning-dedup ledger
     // shared with the `reasoning_items` snapshot path below.
-    // Snapshot-normalize: same complete `S` every chunk (DashScope /
-    // Kimi-style reasoners) must not become `S×N` visible text.
+    // Same complete `S` every chunk must not become `S×N`. These
+    // hops are incremental unless identified as snapshot streams.
     const reasoningSnap = snapshotOrIncremental(
       deltaReasoning,
       state.thinkingAccumulated,
@@ -551,8 +560,9 @@ export const chunkToMessagesEvents = (
   }
 
   // Text delta → open text block (if not already) + content_block_delta.
-  // Snapshot-normalize against the content-only ledger so dumped
-  // reasoning cannot swallow a later answer prefix.
+  // Exact-snapshot dedup against the content-only ledger so dumped
+  // reasoning cannot swallow a later answer prefix, and incremental
+  // chunks that happen to start with the accumulated text still append.
   if (deltaText !== null && deltaText !== undefined && deltaText.length > 0) {
     const textSnap = snapshotOrIncremental(
       deltaText,

@@ -37,15 +37,27 @@ export const backfilledMaxTokens = (
 const finiteNumber = (value: unknown): number | undefined =>
   typeof value === "number" && Number.isFinite(value) ? value : undefined;
 
-/** Effective client output cap on an already-built upstream body. */
+/**
+ * Effective client output cap on an already-built upstream body.
+ * The smallest present sibling wins: a leftover 32k `max_tokens` must
+ * still trigger raise-only backfill even when `max_completion_tokens`
+ * is already at the ceiling (first-present would miss it and leave
+ * the smaller field to shadow upstream).
+ */
 export const clientOutputCapFromBody = (body: unknown): number | undefined => {
   if (body === null || typeof body !== "object") return undefined;
   const rec = body as Record<string, unknown>;
-  return (
-    finiteNumber(rec.max_output_tokens) ??
-    finiteNumber(rec.max_completion_tokens) ??
-    finiteNumber(rec.max_tokens)
-  );
+  const caps: number[] = [];
+  for (const key of [
+    "max_output_tokens",
+    "max_completion_tokens",
+    "max_tokens",
+  ] as const) {
+    const value = finiteNumber(rec[key]);
+    if (value !== undefined) caps.push(value);
+  }
+  if (caps.length === 0) return undefined;
+  return Math.min(...caps);
 };
 
 const inboundRequestedModel = (rawBody: unknown): string | null => {
@@ -81,11 +93,22 @@ export const raiseOutputCapFields = (
     if (wire === "anthropic") return { ...rec, max_tokens: raised };
     return { ...rec, max_completion_tokens: raised };
   }
+  const raiseField = (existing: unknown): number => {
+    const current = finiteNumber(existing);
+    return current === undefined ? raised : Math.max(current, raised);
+  };
+  // Per-field raise-only: a sibling already above the ceiling stays;
+  // a leftover smaller sibling is lifted. Writing every field to
+  // `raised` would lower a generous cap.
   return {
     ...rec,
-    ...(hasOutput ? { max_output_tokens: raised } : {}),
-    ...(hasCompletion ? { max_completion_tokens: raised } : {}),
-    ...(hasTokens ? { max_tokens: raised } : {}),
+    ...(hasOutput
+      ? { max_output_tokens: raiseField(rec.max_output_tokens) }
+      : {}),
+    ...(hasCompletion
+      ? { max_completion_tokens: raiseField(rec.max_completion_tokens) }
+      : {}),
+    ...(hasTokens ? { max_tokens: raiseField(rec.max_tokens) } : {}),
   };
 };
 
