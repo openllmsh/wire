@@ -83,8 +83,22 @@ export type TMessagesStreamState = {
   emittedNonemptyTextDelta: boolean;
   /** Set when `message_stop` is emitted — detects truncated upstream streams. */
   messageStopEmitted: boolean;
-  /** Concatenation of `delta.content` text deltas (for compaction min-length padding). */
+  /** Concatenation of all visible `text_delta`s (content + dumped reasoning). */
   textAccumulated: string;
+  /**
+   * Snapshot ledger for `delta.content` only. Must not share
+   * `textAccumulated`: dumped `reasoning_content` rides that field, and
+   * comparing answer snapshots against it would suppress a real answer
+   * that happens to prefix the dumped thought.
+   */
+  contentSnapshotAccumulated: string;
+  /**
+   * True when the most recently processed chunk carried real provider
+   * usage (`prompt_tokens > 0`). Sticky-ever-seen is wrong: a later
+   * content chunk after a usage frame is a tear, not a clean close.
+   * Live-estimate frames keep prompt_tokens at 0 and stay false.
+   */
+  lastChunkHadProviderUsage: boolean;
   /**
    * How many leading chars of `thinkingAccumulated` were already emitted as
    * `thinking_delta` events. Keeps streaming aligned when `reasoning_items`
@@ -127,11 +141,38 @@ export const newMessagesStreamState = (): TMessagesStreamState => ({
   emittedNonemptyTextDelta: false,
   messageStopEmitted: false,
   textAccumulated: "",
+  contentSnapshotAccumulated: "",
+  lastChunkHadProviderUsage: false,
   thinkingDeltaEmittedLen: 0,
   pendingReasoningSignature: null,
   reasoningSignatureEmitted: false,
   serverSearchCount: 0,
 });
+
+/**
+ * OpenAI-compat hops mix incremental deltas and same/growing snapshots
+ * on `content` and `reasoning_content`. Emit only the new tail when
+ * `incoming` is a prefix-superset of what we already have; ignore a
+ * shorter or identical snapshot; otherwise append as an incremental
+ * delta. Same rule as the `reasoning_items` `startsWith` path.
+ */
+const snapshotOrIncremental = (
+  incoming: string,
+  accumulated: string,
+): { readonly next: string; readonly emit: string } => {
+  if (incoming.length === 0) return { next: accumulated, emit: "" };
+  if (incoming === accumulated) return { next: accumulated, emit: "" };
+  if (
+    accumulated.startsWith(incoming) &&
+    incoming.length < accumulated.length
+  ) {
+    return { next: accumulated, emit: "" };
+  }
+  if (incoming.startsWith(accumulated)) {
+    return { next: incoming, emit: incoming.slice(accumulated.length) };
+  }
+  return { next: accumulated + incoming, emit: incoming };
+};
 
 /**
  * Emit the reasoning `signature_delta` onto the (still-open) thinking
@@ -388,20 +429,26 @@ export const chunkToMessagesEvents = (
     // opened by `emitReasoningSignature`. `thinkingAccumulated` /
     // `thinkingDeltaEmittedLen` stay as the reasoning-dedup ledger
     // shared with the `reasoning_items` snapshot path below.
-    state.thinkingAccumulated += deltaReasoning;
-    const reasoningTail = state.thinkingAccumulated.slice(
-      state.thinkingDeltaEmittedLen,
+    // Snapshot-normalize: same complete `S` every chunk (DashScope /
+    // Kimi-style reasoners) must not become `S×N` visible text.
+    const reasoningSnap = snapshotOrIncremental(
+      deltaReasoning,
+      state.thinkingAccumulated,
     );
-    if (reasoningTail.length > 0 && state.openToolContentIndexes.size === 0) {
+    state.thinkingAccumulated = reasoningSnap.next;
+    if (
+      reasoningSnap.emit.length > 0 &&
+      state.openToolContentIndexes.size === 0
+    ) {
       const idx = openTextBlock(state, out);
       out.push({
         type: "content_block_delta",
         index: idx,
-        delta: { type: "text_delta", text: reasoningTail },
+        delta: { type: "text_delta", text: reasoningSnap.emit },
       });
       state.thinkingDeltaEmittedLen = state.thinkingAccumulated.length;
       state.emittedNonemptyTextDelta = true;
-      state.textAccumulated += reasoningTail;
+      state.textAccumulated += reasoningSnap.emit;
     }
   }
 
@@ -504,15 +551,24 @@ export const chunkToMessagesEvents = (
   }
 
   // Text delta → open text block (if not already) + content_block_delta.
+  // Snapshot-normalize against the content-only ledger so dumped
+  // reasoning cannot swallow a later answer prefix.
   if (deltaText !== null && deltaText !== undefined && deltaText.length > 0) {
-    const idx = openTextBlock(state, out);
-    out.push({
-      type: "content_block_delta",
-      index: idx,
-      delta: { type: "text_delta", text: deltaText },
-    });
-    state.emittedNonemptyTextDelta = true;
-    state.textAccumulated += deltaText;
+    const textSnap = snapshotOrIncremental(
+      deltaText,
+      state.contentSnapshotAccumulated,
+    );
+    if (textSnap.emit.length > 0) {
+      const idx = openTextBlock(state, out);
+      out.push({
+        type: "content_block_delta",
+        index: idx,
+        delta: { type: "text_delta", text: textSnap.emit },
+      });
+      state.emittedNonemptyTextDelta = true;
+      state.contentSnapshotAccumulated = textSnap.next;
+      state.textAccumulated += textSnap.emit;
+    }
   }
 
   // Tool-call deltas → open tool_use blocks + input_json_delta events.
@@ -556,6 +612,8 @@ export const chunkToMessagesEvents = (
     }
   }
 
+  state.lastChunkHadProviderUsage =
+    chunk.usage != null && chunk.usage.prompt_tokens > 0;
   if (chunk.usage != null) {
     state.inputTokens = chunk.usage.prompt_tokens;
     state.cacheReadTokens =
@@ -760,21 +818,21 @@ export const chunksToMessagesSseBytes = (
           const read = await readChunk();
           if (read.done) {
             if (state.startEmitted && !state.messageStopEmitted) {
-              // Upstream ended WITHOUT a finish_reason — the stream was
-              // cut (Vercel maxDuration hard-kill, provider drop,
-              // client/network abort). This terminal is synthetic: we
-              // do NOT know the turn completed. It must signal
-              // truncation (`length` → Anthropic `max_tokens`), never
-              // `stop`. `stop` maps to `end_turn`, which the
-              // tool_use override (chunkToMessagesEvents) promotes to
-              // `stop_reason: "tool_use"` whenever a tool block was
-              // opened — promising Claude Code an executable tool whose
-              // `input_json_delta` is a truncated, unparseable JSON
-              // fragment. Claude Code then blocks forever trying to
-              // JSON.parse it ("announced an action then froze"). With
-              // `length` the override (null/end_turn only) does not
-              // fire, the client sees an honest cut turn and re-prompts
-              // to resume — same contract as `withStreamDeadline`.
+              // Upstream ended WITHOUT a finish_reason. Mid-tool / mid-
+              // text tears (no real usage trailer) stay `length` →
+              // Anthropic `max_tokens` so Claude Code does not treat a
+              // truncated tool_use as executable. A usage trailer with
+              // prompt_tokens > 0 and no open tool is a clean
+              // OpenAI-compat close (DashScope / Kimi often omit
+              // finish_reason) → `stop` / `end_turn`. Live-estimate
+              // frames keep prompt_tokens at 0 and do not flip this.
+              // Only the LAST chunk's usage counts: a usage frame
+              // followed by more content is a tear, not a clean close.
+              const torn =
+                state.openToolContentIndexes.size > 0 ||
+                state.pendingToolCalls.size > 0;
+              const finishReason =
+                !torn && state.lastChunkHadProviderUsage ? "stop" : "length";
               const tail = chunkToMessagesEvents(
                 {
                   id:
@@ -788,7 +846,7 @@ export const chunksToMessagesSseBytes = (
                     {
                       index: 0,
                       delta: {},
-                      finish_reason: "length",
+                      finish_reason: finishReason,
                     },
                   ],
                 },
