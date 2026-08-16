@@ -5,6 +5,7 @@ import type {
 } from "@openllmsh/protocol";
 import { fromAnthropicMessagesRequest } from "../adapters/messages/request";
 import { fromResponsesRequest } from "../adapters/responses";
+import { requestHasImageContent } from "../lib/canonical/content-part";
 import { normaliseAdaptiveThinking } from "./anthropic/adaptive-thinking";
 import {
   ANTHROPIC_FILES_API_BETA,
@@ -347,6 +348,12 @@ export type TBuildUpstreamRequestInput = {
    * (xAI Grok). See {@link canonicalToUpstreamBody}.
    */
   readonly codexInstructions?: boolean;
+  /**
+   * Catalog capabilities for the resolved hop. Empty / missing = unknown
+   * (custom / passthrough) — never treated as non-vision. The vision
+   * gate rejects only when this is NON-empty and lacks `"vision"`.
+   */
+  readonly capabilities?: ReadonlyArray<string>;
 };
 
 /**
@@ -407,19 +414,76 @@ const ensureChatGptSessionAffinity = (
 };
 
 /**
+ * Known-non-vision: catalog hit with a NON-empty capability set that
+ * does not include `"vision"`. Empty / missing capabilities are UNKNOWN
+ * (custom / passthrough) and must never be blocked.
+ */
+const isKnownNonVision = (
+  capabilities: ReadonlyArray<string> | undefined,
+): boolean =>
+  capabilities !== undefined &&
+  capabilities.length > 0 &&
+  !capabilities.includes("vision");
+
+const inboundHasImageContent = (
+  surface: TClientSurface,
+  rawBody: unknown,
+): boolean => {
+  if (surface === "chat_completions") {
+    if (
+      typeof rawBody !== "object" ||
+      rawBody === null ||
+      !("messages" in rawBody) ||
+      !Array.isArray((rawBody as { messages: unknown }).messages)
+    ) {
+      return false;
+    }
+    return requestHasImageContent(rawBody as TChatCompletionRequest);
+  }
+  try {
+    return requestHasImageContent(canonicalFromInbound(surface, rawBody));
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Thrown when a known-non-vision hop would otherwise leak `image_url`
+ * to a text-only OpenAI-compat backend. `type` + `name` are both the
+ * `unsupported_content` tag the tests (and callers) match.
+ */
+export class UnsupportedContentError extends Error {
+  readonly type = "unsupported_content";
+  constructor(providerModelId: string) {
+    super(
+      `unsupported_content: model "${providerModelId}" does not support image content`,
+    );
+    this.name = "unsupported_content";
+  }
+}
+
+/**
  * Prepare the `{ body, headers }` for ONE upstream call. The only place the
  * `(clientWire × upstreamWire)` request recipe lives.
  */
 export const buildUpstreamRequest = (
   i: TBuildUpstreamRequestInput,
-): { readonly body: unknown; readonly headers: Record<string, string> } => ({
-  body: buildUpstreamBody(
-    i.surface,
-    i.upstreamWire,
-    i.rawBody,
-    i.providerModelId,
-    i.stream,
-    i.codexInstructions,
-  ),
-  headers: buildUpstreamHeaders(i),
-});
+): { readonly body: unknown; readonly headers: Record<string, string> } => {
+  if (
+    isKnownNonVision(i.capabilities) &&
+    inboundHasImageContent(i.surface, i.rawBody)
+  ) {
+    throw new UnsupportedContentError(i.providerModelId);
+  }
+  return {
+    body: buildUpstreamBody(
+      i.surface,
+      i.upstreamWire,
+      i.rawBody,
+      i.providerModelId,
+      i.stream,
+      i.codexInstructions,
+    ),
+    headers: buildUpstreamHeaders(i),
+  };
+};
