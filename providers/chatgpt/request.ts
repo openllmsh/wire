@@ -9,7 +9,6 @@ import {
   type TReasoningResponsesInput,
 } from "../../adapters/messages/reasoning-signature";
 import { extractMessageText } from "../../lib/canonical/message";
-import { CHATGPT_DEFAULT_INSTRUCTIONS as chatGptDefaultInstructions } from "./common";
 
 const CHATGPT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 const CHATGPT_NAME_SUB_RE = /[^a-zA-Z0-9_-]/g;
@@ -34,7 +33,8 @@ const stableHash = (s: string): string => {
 
 /**
  * Hash the IMMUTABLE conversation prefix — the first user turn's COMPLETE
- * content plus the system `instructions` — into a stable 16-hex digest. Shared
+ * content plus canonical system text (`instructions`) — into a stable 16-hex
+ * digest. Shared
  * by {@link derivePromptCacheKey} and {@link deriveChatGptSessionId}: both key
  * off this prefix (it never changes as the conversation grows), so both are
  * stable across turns and distinct across conversations. JSON (not a delimited
@@ -54,12 +54,11 @@ const conversationPrefixHash = (
  * Derive a prompt-cache key that is STABLE across every turn of one
  * conversation and DISTINCT across conversations. Codex uses its own
  * `thread_id`; the stateless gateway has none, so we key off the immutable
- * conversation prefix — the `instructions` (Codex preamble + any user system
- * text) plus the first user turn — which never changes as the conversation
- * grows. Without this, OpenAI's automatic prefix-hash routing collides every
- * conversation onto the same cache lane (our Codex preamble prefix is
- * byte-identical across users), so distinct conversations evict each other and
- * cache-hit rate collapses — burning subscription quota. See the reference
+ * conversation prefix — the canonical system text plus the first user turn —
+ * which never changes as the conversation grows. Without this, OpenAI's
+ * automatic prefix-hash routing can collide distinct conversations onto the
+ * same cache lane, causing them to evict each other and cache-hit rate to
+ * collapse — burning subscription quota. See the reference
  * `codex-rs/core/src/client.rs::prompt_cache_key`.
  */
 const derivePromptCacheKey = (
@@ -199,12 +198,14 @@ const contentToOutputParts = (
 };
 
 /**
- * Pull every `role: "system"` message out of the array, return both the
- * trimmed message list and the concatenated text. ChatGPT's
- * `/backend-api/codex/responses` endpoint rejects system turns on the
- * wire — they must ride in the top-level `instructions` field.
+ * Pull every `role: "system"` message out of the array, returning both the
+ * non-system conversation and concatenated system text. This helper exists
+ * only for stable prompt-cache and session hashing: outbound system turns are
+ * emitted as `developer` input items, while the top-level `instructions` field
+ * is always empty.
  *
- * Mirrors `_merge_system_and_developer_into_instruction_text` from
+ * Mirrors the immutable-prefix portion of
+ * `_merge_system_and_developer_into_instruction_text` from
  * `chat/transformation.py:41-61`.
  */
 const extractSystemInstructions = (
@@ -235,8 +236,8 @@ const extractSystemInstructions = (
  * immutable conversation prefix (first user turn + system instructions),
  * mirroring {@link derivePromptCacheKey}: stable across every turn of one
  * conversation, distinct across conversations (so traffic doesn't hot-spot one
- * machine). Independent of the Codex-preamble injection so it doesn't shift
- * when instructions do.
+ * machine). The hash retains canonical system text even though the outbound
+ * `instructions` field is always empty.
  */
 export const deriveChatGptSessionId = (req: TChatCompletionRequest): string => {
   const { conversation, instructions } = extractSystemInstructions(
@@ -311,8 +312,8 @@ const toolResultToItems = (
  * `convert_chat_completion_messages_to_responses_api` from
  * `completion_extras/litellm_responses_transformation/transformation.py:203-289`.
  *
- * - `user` / `system` content -> `input_text` parts (system already
- *   pulled into `instructions` upstream of this call).
+ * - `system` content          -> `input_text` parts on a `developer` message.
+ * - `user` content            -> `input_text` parts on a `user` message.
  * - `assistant` text content  -> `output_text` parts.
  * - `assistant.tool_calls`    -> one `function_call` item per call.
  * - `tool` (tool result)      -> `function_call_output` (string) via
@@ -323,6 +324,16 @@ const messagesToInputItems = (
 ): TResponsesInputItem[] => {
   const items: TResponsesInputItem[] = [];
   for (const msg of messages) {
+    if (msg.role === "system") {
+      const text = extractMessageText(msg.content);
+      if (text.trim().length === 0) continue;
+      items.push({
+        type: "message",
+        role: "developer",
+        content: contentToInputParts(msg.content),
+      });
+      continue;
+    }
     if (msg.role === "user") {
       items.push({
         type: "message",
@@ -377,7 +388,6 @@ const messagesToInputItems = (
         });
       }
     }
-    // system messages are filtered out before this call.
   }
   return items;
 };
@@ -503,6 +513,7 @@ const toResponsesToolChoice = (
 export type TChatGptRequestBody = {
   readonly model: string;
   readonly input: ReadonlyArray<TResponsesInputItem>;
+  // Always empty: canonical system messages are emitted as `developer` input.
   readonly instructions: string;
   readonly stream: true;
   readonly store: false;
@@ -535,9 +546,8 @@ export type TChatGptRequestBody = {
 /**
  * Convert canonical OpenAI ChatCompletion → ChatGPT/Codex Responses API body.
  *
- * 1. Pull system messages into `instructions`.
- * 2. Prepend the Codex preamble if not already present (required by
- *    gpt-5.x or the server returns empty `output`).
+ * 1. Preserve system messages as `developer` items inside `input`.
+ * 2. Keep top-level `instructions` as an empty string.
  * 3. Convert `messages` -> `input` items.
  * 4. Sanitize every tool name + assistant tool_call name.
  * 5. Force `stream: true`, `store: false`,
@@ -546,6 +556,9 @@ export type TChatGptRequestBody = {
  *    non-Codex upstreams only (`codexInstructions: false`).
  * 7. Map `reasoning_effort` -> `reasoning.effort` (+ `summary: "auto"`).
  * 8. DROP every other key — only the allowed-list is forwarded.
+ *
+ * System text still feeds prompt-cache/session hashing, but never the body
+ * `instructions` field.
  *
  * Mirrors `transform_request` in `chat/transformation.py:212-248` plus
  * the Responses-API allowed-list filter in
@@ -558,23 +571,7 @@ export const toChatGptRequest = (
   const { conversation, instructions: fromSystem } = extractSystemInstructions(
     req.messages,
   );
-
-  // Codex identity floor for BARE clients on the ChatGPT/Codex wire. This is
-  // NOT a gateway policy prefix — it is the Codex identity the ChatGPT backend
-  // historically needed. Apply it ONLY when (a) the caller wants it
-  // (`codexInstructions !== false`; `false` suppresses it for xAI Grok) AND
-  // (b) the client sent NO instructions of its own. A real Codex client always
-  // sends its own (newer) preamble — layering ours on top is a DOUBLE preamble
-  // that wastes input every turn and is unnecessary (current models produce
-  // output with no preamble at all — audit 2026-07-14-codex-upstream-wire §6
-  // F10). So we trust the client's instructions verbatim and only add ours as
-  // a floor for a bare client.
-  const instructions =
-    options.codexInstructions !== false && fromSystem.length === 0
-      ? chatGptDefaultInstructions
-      : fromSystem;
-
-  const input = messagesToInputItems(conversation);
+  const input = messagesToInputItems(req.messages);
   // Prefer the verbatim `responses_tools` passthrough (Codex's full original
   // tool set, function + non-function) — it round-trips apply_patch /
   // web_search / image_generation / tool_search intact to the same endpoint
@@ -594,7 +591,7 @@ export const toChatGptRequest = (
   return {
     model: options.providerModelId,
     input,
-    instructions,
+    instructions: "",
     stream: true,
     store: false,
     include: ["reasoning.encrypted_content"],
@@ -604,7 +601,7 @@ export const toChatGptRequest = (
     prompt_cache_key: clampPromptCacheKey(
       req.prompt_cache_key !== undefined && req.prompt_cache_key.length > 0
         ? req.prompt_cache_key
-        : derivePromptCacheKey(instructions, conversation),
+        : derivePromptCacheKey(fromSystem, conversation),
     ),
     ...(responsesTools !== undefined ? { tools: responsesTools } : {}),
     ...(req.tool_choice !== undefined
