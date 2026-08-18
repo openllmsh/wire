@@ -8,7 +8,6 @@ import { ensureCompactionSafeVisibleText } from "../../features/compaction/compa
 import { parseToolArguments } from "../../lib/canonical/message";
 import {
   anthropicStopReasonFrom,
-  REASONING_PLACEHOLDER_TEXT,
   visibleAnswerAfterThought,
 } from "./anthropic-map";
 import { plainTextFromReasoningItems } from "./reasoning-from-items";
@@ -116,7 +115,7 @@ export const toAnthropicMessagesResponse = (
   if (reasoningSignature !== null) {
     content.push({
       type: "thinking",
-      thinking: reasoning.length > 0 ? reasoning : REASONING_PLACEHOLDER_TEXT,
+      thinking: reasoning,
       signature: reasoningSignature,
     });
   }
@@ -147,10 +146,10 @@ export const toAnthropicMessagesResponse = (
 
   // Claude Code `/compact` requires a non-empty user-visible `text`
   // block for thinking-only replies. Never clone a signed summary
-  // (second ⏺). Pad with the placeholder only when the thinking
-  // block has no human summary. Unsigned leftover (Kimi) is the
-  // only visible channel and still becomes text. Same rule as the
-  // streaming adapter.
+  // (second ⏺). Use the compaction helper's neutral fallback only when
+  // the thinking block has no human summary. Unsigned leftover (Kimi)
+  // is the only visible channel and still becomes text. Same rule as
+  // the streaming adapter.
   const restatedSignedThought =
     reasoningSignature !== null && text.length > 0 && answerText.length === 0;
   if (!content.some((b) => b.type === "text") && !restatedSignedThought) {
@@ -158,7 +157,7 @@ export const toAnthropicMessagesResponse = (
       if (reasoning.length === 0) {
         content.push({
           type: "text",
-          text: ensureCompactionSafeVisibleText(REASONING_PLACEHOLDER_TEXT),
+          text: ensureCompactionSafeVisibleText(""),
         });
       }
     } else if (reasoning.length > 0) {

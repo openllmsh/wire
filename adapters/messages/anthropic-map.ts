@@ -1,12 +1,6 @@
 import type { TAnthropicStopReason } from "@openllmsh/protocol";
 
 /**
- * Shown as the (collapsed) thinking text when an upstream reasoning
- * item carries resumable `encrypted_content` but no human summary.
- */
-export const REASONING_PLACEHOLDER_TEXT = "[reasoning]";
-
-/**
  * Visible answer after stripping a signed thought the model repeated
  * as `content`. Prefix / exact restatement → hide; thought then extra
  * → only the extra; anything else → the content as-is.
