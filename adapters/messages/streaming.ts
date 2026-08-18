@@ -350,6 +350,25 @@ const openBufferedToolBlock = (
  * that never got a name are dropped (an unnamed tool is unexecutable) — mirrors
  * CLIProxyAPI's belated-emit that skips `accumulator.Name == ""`.
  */
+/**
+ * Open every NAMED pending tool call that was deliberately buffered while a
+ * reasoning signature was still unsummarized (Codex streams the tool call
+ * before the summary). Unlike `flushPendingToolBlocks`, this leaves the block
+ * OPEN so any trailing argument fragments still stream through; it closes at
+ * finish. Nameless pending calls are left untouched (they wait for a name).
+ */
+const openDeferredToolBlocks = (
+  state: TMessagesStreamState,
+  out: TAnthropicStreamEvent[],
+): void => {
+  const indexes = [...state.pendingToolCalls.keys()].sort((a, b) => a - b);
+  for (const idx of indexes) {
+    const pending = state.pendingToolCalls.get(idx);
+    if (pending === undefined || pending.name === "") continue;
+    openBufferedToolBlock(state, out, idx, pending);
+  }
+};
+
 const flushPendingToolBlocks = (
   state: TMessagesStreamState,
   out: TAnthropicStreamEvent[],
@@ -486,7 +505,18 @@ export const chunkToMessagesEvents = (
   );
   if (reasoningItems.length > 0) {
     const sig = encodeReasoningSignature(reasoningItems);
-    if (sig !== null) state.pendingReasoningSignature = sig;
+    if (sig !== null) {
+      // A distinct new signature while one is still pending (Grok interleaves
+      // multiple reasoning items) — seal the prior item as its own thinking
+      // block before adopting the new one, so neither signature is lost.
+      if (
+        state.pendingReasoningSignature !== null &&
+        state.pendingReasoningSignature !== sig
+      ) {
+        emitReasoningSignature(state, out);
+      }
+      state.pendingReasoningSignature = sig;
+    }
   }
 
   const fromReasoningItems = plainTextFromReasoningItems(
@@ -503,10 +533,26 @@ export const chunkToMessagesEvents = (
     state.thinkingAccumulated = fromReasoningItems;
   }
 
-  // Reasoning state arrived (Codex `reasoning` item completed) — seal it
-  // onto the thinking block now, while it is still open and before any
-  // tool_use block, so Claude Code replays the `signature` next turn.
-  emitReasoningSignature(state, out);
+  // Seal the signature onto the thinking block — but only once a human
+  // summary is actually present. In the normal ordering the summary streams
+  // BEFORE the encrypted reasoning item, so `thinkingAccumulated` is already
+  // populated here and we seal immediately (Claude Code replays the signature
+  // next turn). Codex (gpt-5.6-terra) inverts this: the encrypted item's
+  // `output_item.done` arrives with `summary: []` BEFORE the `summary_text`
+  // deltas — sealing here would close the block empty → the "[reasoning]"
+  // placeholder, stranding the summary that streams a beat later. So when the
+  // accumulator is still empty we DEFER: the seal fires at the next
+  // non-reasoning boundary (server search / text / tool_use, below) or at
+  // finish, by which point the summary has folded in. Either way the
+  // signature_delta stays the thinking block's last delta, before any
+  // tool_use opens (Anthropic's constraint).
+  if (state.thinkingAccumulated.length > 0) {
+    emitReasoningSignature(state, out);
+    // Codex can stream the tool call BEFORE the summary; those tool calls were
+    // buffered (not opened) so the now-sealed thinking block precedes them.
+    // Open them now that the signature is in place.
+    openDeferredToolBlocks(state, out);
+  }
 
   // Provider-executed hosted searches (Codex `webSearch` items on a chatgpt
   // hop) → self-contained server_tool_use + web_search_tool_result block
@@ -517,6 +563,9 @@ export const chunkToMessagesEvents = (
   // findings ride the grounded answer text (see the JSON adapter's note).
   const deltaSearches = choice?.delta.server_search_calls ?? null;
   if (deltaSearches !== null && deltaSearches !== undefined) {
+    // Boundary: seal any deferred signature onto the thinking block before it
+    // is closed for the server-search blocks.
+    emitReasoningSignature(state, out);
     for (const search of deltaSearches) {
       closeTextBlock(state, out);
       closeAllToolBlocks(state, out);
@@ -568,6 +617,9 @@ export const chunkToMessagesEvents = (
   // Signed hops also drop content that merely restates the thought
   // (field sample: same sentence as a second ⏺ after "Thought for 1s").
   if (deltaText !== null && deltaText !== undefined && deltaText.length > 0) {
+    // Boundary: the answer text starts — seal any deferred signature (with the
+    // summary accumulated so far) before the visible text block opens.
+    emitReasoningSignature(state, out);
     const textSnap = foldDelta(
       deltaText,
       state.contentSnapshotAccumulated,
@@ -593,6 +645,21 @@ export const chunkToMessagesEvents = (
 
   // Tool-call deltas → open tool_use blocks + input_json_delta events.
   if (deltaToolCalls !== null && deltaToolCalls !== undefined) {
+    // A reasoning signature is pending but its summary hasn't streamed yet
+    // (Codex emits the tool call BEFORE the summary_text on some turns).
+    // Sealing here would close the thinking block empty → "[reasoning]", and
+    // opening the tool_use would forbid a later signature (Anthropic requires
+    // the signature to precede any tool_use). So DEFER: keep buffering the
+    // tool call's id/name/args and open nothing until the summary arrives and
+    // the seal fires (`openDeferredToolBlocks`), or until finish.
+    const deferForReasoning =
+      state.pendingReasoningSignature !== null &&
+      state.thinkingAccumulated.length === 0;
+    if (!deferForReasoning) {
+      // Boundary: seal any deferred signature (with the accumulated summary)
+      // BEFORE the first tool_use block opens.
+      emitReasoningSignature(state, out);
+    }
     for (const tc of deltaToolCalls) {
       const contentIndex = state.toolCallToContentIndex.get(tc.index);
       if (contentIndex !== undefined) {
@@ -625,8 +692,9 @@ export const chunkToMessagesEvents = (
       }
       pending.args += tc.function?.arguments ?? "";
       state.pendingToolCalls.set(tc.index, pending);
-      // The moment we know the name, open the block and flush buffered args.
-      if (pending.name !== "") {
+      // The moment we know the name, open the block and flush buffered args —
+      // unless we're holding tool output until the reasoning signature seals.
+      if (pending.name !== "" && !deferForReasoning) {
         openBufferedToolBlock(state, out, tc.index, pending);
       }
     }
@@ -677,6 +745,12 @@ export const chunkToMessagesEvents = (
 
   if (choice?.finish_reason !== null && choice?.finish_reason !== undefined) {
     let finalStopReason = anthropicStopReasonFrom(choice.finish_reason);
+    // Seal any still-deferred reasoning signature BEFORE flushing buffered tool
+    // blocks — a tool call held for reasoning (Codex tool-before-summary) that
+    // never received a summary must still get its signature-bearing thinking
+    // block (placeholder) ahead of the tool_use (Anthropic ordering). No-op if
+    // nothing is pending or a tool block is already open.
+    emitReasoningSignature(state, out);
     // A tool call whose name only arrived on the terminal event (or never
     // streamed a `content_block_start` because its name stayed empty until
     // now) is opened + closed here so a named-but-unopened `Task`/`Agent`
