@@ -752,10 +752,16 @@ export const chunkToMessagesEvents = (
     } else if (
       !state.emittedNonemptyTextDelta &&
       state.sealedSignedThinking &&
-      state.thinkingAccumulated.length === 0
+      state.thinkingAccumulated.length === 0 &&
+      !state.emittedToolUse
     ) {
       // Signed thinking with no human summary still needs a compact-safe
       // text block. Do not clone a non-empty sealed summary (second ⏺).
+      // A TOOL turn is exempt: `/compact` only ever reads a text-only
+      // reply, while a tool_use turn with no summary is the normal shape
+      // of a reasoning model calling a tool (every Codex `spark` step).
+      // Emitting the fallback there printed a stray "no visible summary
+      // text was returned for this compaction" ⏺ before every tool call.
       emitVisibleText(state, out, ensureCompactionSafeVisibleText(""));
       closeTextBlock(state, out);
     }

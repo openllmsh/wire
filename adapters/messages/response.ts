@@ -152,9 +152,14 @@ export const toAnthropicMessagesResponse = (
   // the streaming adapter.
   const restatedSignedThought =
     reasoningSignature !== null && text.length > 0 && answerText.length === 0;
+  // A tool_use turn is exempt from the empty fallback: `/compact` only
+  // reads a text-only reply, and a reasoning model that calls a tool with
+  // no summary is the normal shape — the fallback there printed a stray
+  // "no visible summary text..." block before every tool call.
+  const emittedToolUse = content.some((b) => b.type === "tool_use");
   if (!content.some((b) => b.type === "text") && !restatedSignedThought) {
     if (reasoningSignature !== null) {
-      if (reasoning.length === 0) {
+      if (reasoning.length === 0 && !emittedToolUse) {
         content.push({
           type: "text",
           text: ensureCompactionSafeVisibleText(""),
