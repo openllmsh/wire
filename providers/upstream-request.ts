@@ -181,9 +181,14 @@ export const canonicalToUpstreamBody = (
     return { ...toAnthropicRequest(canonical, options), stream };
   }
   // openai-identity passthrough: forward canonical verbatim, but DROP the
-  // `responses_tools` carrier — it's a Codex/Responses-only field that
-  // chatgpt re-emits; openai-compatible upstreams 400 on the unknown key.
-  const { responses_tools: _responsesTools, ...openai } = canonical;
+  // Responses-only opaque carriers — chatgpt re-emits them; openai-compatible
+  // upstreams 400 on unknown keys.
+  const {
+    responses_tools: _responsesTools,
+    responses_additional_tools: _responsesAdditionalTools,
+    responses_client_metadata: _responsesClientMetadata,
+    ...openai
+  } = canonical;
   const streamOptions =
     stream === true
       ? { ...openai.stream_options, include_usage: true }

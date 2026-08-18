@@ -40,7 +40,9 @@ export const responsesBodyHasEncryptedContent = (body: unknown): boolean => {
 
 /** Return a copy of a built Responses body with `encrypted_content` removed
  *  from every `reasoning` input item (the item itself stays — its `summary`
- *  keeps the visible chain — only the resumable ciphertext is dropped). */
+ *  keeps the visible chain). The orphan `id` is dropped too: with
+ *  `store: false` Codex treats a named reasoning item as a persisted lookup
+ *  and 400s ("Item not found") when the ciphertext is gone. */
 export const stripResponsesEncryptedContent = (body: unknown): unknown => {
   if (body === null || typeof body !== "object") return body;
   const b = body as { input?: unknown };
@@ -53,10 +55,11 @@ export const stripResponsesEncryptedContent = (body: unknown): unknown => {
     ) {
       return item;
     }
-    const { encrypted_content: _dropped, ...rest } = item as Record<
-      string,
-      unknown
-    >;
+    const {
+      encrypted_content: _dropped,
+      id: _removedId,
+      ...rest
+    } = item as Record<string, unknown>;
     return rest;
   });
   return { ...(body as Record<string, unknown>), input };

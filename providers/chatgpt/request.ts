@@ -158,6 +158,13 @@ type TResponsesInputItem =
       readonly call_id: string;
       readonly output: string;
     }
+  | {
+      /** Opaque Codex harness declarations, preserved from Responses input. */
+      readonly type: "additional_tools";
+      readonly role: "developer";
+      readonly tools: ReadonlyArray<unknown>;
+      readonly [key: string]: unknown;
+    }
   | TReasoningResponsesInput;
 
 const contentToInputParts = (
@@ -350,6 +357,7 @@ const toolResultToItems = (
  */
 const messagesToInputItems = (
   messages: ReadonlyArray<TChatMessage>,
+  toolNames: ReadonlyMap<string, string>,
 ): TResponsesInputItem[] => {
   const items: TResponsesInputItem[] = [];
   for (const msg of messages) {
@@ -391,7 +399,7 @@ const messagesToInputItems = (
           items.push({
             type: "function_call",
             call_id: clampCodexCallId(call.id),
-            name: sanitizeName(call.function.name),
+            name: outboundToolName(call.function.name, toolNames),
             arguments: call.function.arguments,
           });
         }
@@ -419,6 +427,32 @@ const messagesToInputItems = (
     }
   }
   return items;
+};
+
+/**
+ * Recover the opaque leading `additional_tools` input items carried through the
+ * canonical request. They originate at the validated Responses boundary; the
+ * narrow runtime check keeps an arbitrary canonical caller from injecting a
+ * malformed input item while preserving accepted payloads byte-for-byte.
+ */
+const additionalToolsToInputItems = (
+  items: ReadonlyArray<unknown> | undefined,
+): TResponsesInputItem[] => {
+  if (items === undefined) return [];
+  const result: TResponsesInputItem[] = [];
+  for (const item of items) {
+    if (
+      item !== null &&
+      typeof item === "object" &&
+      !Array.isArray(item) &&
+      (item as { readonly type?: unknown }).type === "additional_tools" &&
+      (item as { readonly role?: unknown }).role === "developer" &&
+      Array.isArray((item as { readonly tools?: unknown }).tools)
+    ) {
+      result.push(item as TResponsesInputItem);
+    }
+  }
+  return result;
 };
 
 const LOOKAROUND_RE = /\(\?[=!]|\(\?<[=!]/;
@@ -477,22 +511,17 @@ type TResponsesPassthroughToolDef = {
 
 const EMPTY_TOOL_NAME_MAP: ReadonlyMap<string, string> = new Map();
 
-/** A deterministic request-build failure: two client tools would become one
- * Responses tool after the required Codex name sanitation. */
-export class ChatGptToolNameCollisionError extends Error {
-  readonly type = "tool_name_collision";
+type TChatGptToolNameMaps = {
+  /** Original client name → final unique Responses name. */
+  readonly outbound: ReadonlyMap<string, string>;
+  /** Final unique Responses name → original client name. */
+  readonly inbound: ReadonlyMap<string, string>;
+};
 
-  constructor(
-    readonly sanitizedName: string,
-    readonly firstOriginalName: string,
-    readonly secondOriginalName: string,
-  ) {
-    super(
-      `ChatGPT tool-name collision: ${JSON.stringify(firstOriginalName)} and ${JSON.stringify(secondOriginalName)} both sanitize to ${JSON.stringify(sanitizedName)}`,
-    );
-    this.name = "ChatGptToolNameCollisionError";
-  }
-}
+const EMPTY_TOOL_NAME_MAPS: TChatGptToolNameMaps = {
+  outbound: EMPTY_TOOL_NAME_MAP,
+  inbound: EMPTY_TOOL_NAME_MAP,
+};
 
 const functionResponsesToolName = (tool: unknown): string | undefined => {
   if (tool === null || typeof tool !== "object" || Array.isArray(tool)) {
@@ -505,14 +534,9 @@ const functionResponsesToolName = (tool: unknown): string | undefined => {
 };
 
 /**
- * Build the request-scoped reverse mapping the Responses stream needs to put
- * every client tool name back exactly as it was sent to OpenLLM. Only lossy
- * rewrites are retained, so normal valid <=64-character names share the empty
- * map and add no stream-state or decoder work.
- *
- * Both canonical `tools` and opaque Responses `responses_tools` participate in
- * collision detection. The latter wins when emitted, but accepting an ambiguous
- * canonical request would make a later representation change unsafe.
+ * Visit declared function names in their request order. Stable declaration
+ * ordering makes suffix assignment reproducible across the request encoder and
+ * stream decoder setup.
  */
 const forEachFunctionToolName = (
   req: Pick<TChatCompletionRequest, "tools" | "responses_tools">,
@@ -525,45 +549,70 @@ const forEachFunctionToolName = (
   }
 };
 
-export const buildChatGptToolNameMap = (
+/** Append a numeric suffix while retaining Codex's 64-character bound. */
+const makeUniqueToolName = (
+  base: string,
+  used: ReadonlySet<string>,
+): string => {
+  if (!used.has(base)) return base;
+  for (let suffixNumber = 1; ; suffixNumber++) {
+    const suffix = `_${suffixNumber}`;
+    const prefixLength = Math.max(0, CODEX_IDENTIFIER_MAX_LENGTH - suffix.length);
+    const candidate = `${base.slice(0, prefixLength)}${suffix}`;
+    if (!used.has(candidate)) return candidate;
+  }
+};
+
+/**
+ * Build the paired request-scoped maps for Codex tool identifiers. Distinct
+ * originals that normalize to the same Responses name are assigned `_1`, `_2`,
+ * … in declaration order rather than rejecting the whole request. Repeated
+ * declarations of one original reuse its first assignment.
+ */
+const buildChatGptToolNameMaps = (
   req: Pick<TChatCompletionRequest, "tools" | "responses_tools">,
-): ReadonlyMap<string, string> => {
-  // Avoid even a per-request Map allocation in the overwhelmingly common clean
-  // case. A collision needs at least one lossy rewrite, so only that path needs
-  // a second pass to retain every sanitized name for collision detection.
+): TChatGptToolNameMaps => {
   let hasLossyRewrite = false;
   forEachFunctionToolName(req, (name) => {
     if (sanitizeName(name) !== name) hasLossyRewrite = true;
   });
-  if (!hasLossyRewrite) return EMPTY_TOOL_NAME_MAP;
+  if (!hasLossyRewrite) return EMPTY_TOOL_NAME_MAPS;
 
-  const originalBySanitized = new Map<string, string>();
-  const reverseMap = new Map<string, string>();
+  const outbound = new Map<string, string>();
+  const inbound = new Map<string, string>();
+  const used = new Set<string>();
   forEachFunctionToolName(req, (originalName) => {
-    const sanitizedName = sanitizeName(originalName);
-    const existing = originalBySanitized.get(sanitizedName);
-    if (existing !== undefined && existing !== originalName) {
-      throw new ChatGptToolNameCollisionError(
-        sanitizedName,
-        existing,
-        originalName,
-      );
-    }
-    originalBySanitized.set(sanitizedName, originalName);
-    if (sanitizedName !== originalName) {
-      reverseMap.set(sanitizedName, originalName);
+    if (outbound.has(originalName)) return;
+    const assignedName = makeUniqueToolName(sanitizeName(originalName), used);
+    outbound.set(originalName, assignedName);
+    used.add(assignedName);
+    if (assignedName !== originalName) {
+      inbound.set(assignedName, originalName);
     }
   });
-
-  return reverseMap;
+  return { outbound, inbound };
 };
+
+/**
+ * Build the request-scoped reverse mapping the Responses stream needs to put
+ * every client tool name back exactly as it was sent to OpenLLM.
+ */
+export const buildChatGptToolNameMap = (
+  req: Pick<TChatCompletionRequest, "tools" | "responses_tools">,
+): ReadonlyMap<string, string> => buildChatGptToolNameMaps(req).inbound;
+
+const outboundToolName = (
+  originalName: string,
+  names: ReadonlyMap<string, string>,
+): string => names.get(originalName) ?? sanitizeName(originalName);
 
 const toolsToResponses = (
   tools: NonNullable<TChatCompletionRequest["tools"]>,
+  toolNames: ReadonlyMap<string, string>,
 ): TResponsesToolDef[] =>
   tools.map((tool) => ({
     type: "function",
-    name: sanitizeName(tool.function.name),
+    name: outboundToolName(tool.function.name, toolNames),
     ...(tool.function.description !== undefined
       ? { description: tool.function.description }
       : {}),
@@ -585,13 +634,14 @@ const toolsToResponses = (
  */
 const sanitizeResponsesTools = (
   tools: ReadonlyArray<TResponsesPassthroughToolDef>,
+  toolNames: ReadonlyMap<string, string>,
 ): ReadonlyArray<TResponsesPassthroughToolDef> =>
   tools.map((tool) => {
     if (tool.type !== "function") return tool;
     return {
       ...tool,
       ...(typeof tool.name === "string"
-        ? { name: sanitizeName(tool.name) }
+        ? { name: outboundToolName(tool.name, toolNames) }
         : {}),
       ...("parameters" in tool
         ? { parameters: sanitizeToolParameters(tool.parameters) }
@@ -611,10 +661,36 @@ type TResponsesToolChoice =
 
 const toResponsesToolChoice = (
   choice: NonNullable<TChatCompletionRequest["tool_choice"]>,
+  toolNames: ReadonlyMap<string, string>,
 ): TResponsesToolChoice =>
   choice === "auto" || choice === "none" || choice === "required"
     ? choice
-    : { type: "function", name: sanitizeName(choice.function.name) };
+    : {
+        type: "function",
+        name: outboundToolName(choice.function.name, toolNames),
+      };
+
+/**
+ * The Codex client provides the only reliable Responses-Lite signal: it mirrors
+ * the internal websocket header into `client_metadata`. Model ids and account
+ * tiers are deliberately NOT used — both Lite and full Responses can serve the
+ * same catalog ids.
+ */
+const isCodexResponsesLite = (clientMetadata: unknown): boolean => {
+  if (
+    clientMetadata === null ||
+    typeof clientMetadata !== "object" ||
+    Array.isArray(clientMetadata)
+  ) {
+    return false;
+  }
+  const marker = (clientMetadata as Record<string, unknown>)
+    .ws_request_header_x_openai_internal_codex_responses_lite;
+  return (
+    marker === true ||
+    (typeof marker === "string" && marker.trim().toLowerCase() === "true")
+  );
+};
 
 // runtime-only: payload sent to `/backend-api/codex/responses`. Strictly
 // the keys allowed by `ChatGPTResponsesAPIConfig.transform_responses_api_request`
@@ -637,9 +713,11 @@ export type TChatGptRequestBody = {
   readonly stream: true;
   readonly store: false;
   readonly include: ReadonlyArray<string>;
-  // Codex Responses-Lite requires `parallel_tool_calls` to be false; this is
-  // the native setting on codex v0.147 responses paths.
+  // Responses-Lite requires false; full Codex Responses requires true. The
+  // authoritative Lite marker lives in `client_metadata`, never a model id.
   readonly parallel_tool_calls?: boolean;
+  /** Opaque Codex request metadata, including the Responses-Lite marker. */
+  readonly client_metadata?: unknown;
   // The client's token cap — emitted ONLY on the non-Codex Responses
   // variant (`codexInstructions: false`, i.e. grok), where the chat proxy
   // honors it as a hard cap (verified live 2026-07-14). The chatgpt.com
@@ -697,11 +775,18 @@ export const toChatGptRequest = (
   const { conversation, instructions: fromSystem } = extractSystemInstructions(
     req.messages,
   );
-  const input = messagesToInputItems(req.messages);
-  // Validate every function tool before assembling the outbound body. A collision
-  // would make the upstream tool namespace ambiguous and cannot be reversed on
-  // the stream back to the client.
-  buildChatGptToolNameMap(req);
+  const isCodex = options.codexInstructions !== false;
+  // Assign names once so function definitions, tool choices, and replayed
+  // assistant calls all use the same final identifier.
+  const toolNameMaps = buildChatGptToolNameMaps(req);
+  // Codex requires harness declarations before every conversational turn.
+  // They are not part of Grok's Responses contract.
+  const input = [
+    ...(isCodex
+      ? additionalToolsToInputItems(req.responses_additional_tools)
+      : []),
+    ...messagesToInputItems(req.messages, toolNameMaps.outbound),
+  ];
   // Prefer the verbatim `responses_tools` passthrough (Codex's full original
   // tool set, function + non-function) — it round-trips apply_patch /
   // web_search / image_generation / tool_search intact to the same endpoint
@@ -713,9 +798,10 @@ export const toChatGptRequest = (
     req.responses_tools !== undefined && req.responses_tools.length > 0
       ? sanitizeResponsesTools(
           req.responses_tools as ReadonlyArray<TResponsesPassthroughToolDef>,
+          toolNameMaps.outbound,
         )
       : req.tools !== undefined && req.tools.length > 0
-        ? toolsToResponses(req.tools)
+        ? toolsToResponses(req.tools, toolNameMaps.outbound)
         : undefined;
 
   return {
@@ -725,8 +811,19 @@ export const toChatGptRequest = (
     stream: true,
     store: false,
     include: ["reasoning.encrypted_content"],
-    ...(options.codexInstructions !== false
-      ? { parallel_tool_calls: false }
+    // Lite always disables parallel calls. Full Codex honors an explicit client
+    // value and otherwise preserves Codex's default of parallel calls enabled.
+    ...(isCodex
+      ? {
+          parallel_tool_calls: isCodexResponsesLite(
+            req.responses_client_metadata,
+          )
+            ? false
+            : (req.parallel_tool_calls ?? true),
+        }
+      : {}),
+    ...(isCodex && req.responses_client_metadata !== undefined
+      ? { client_metadata: req.responses_client_metadata }
       : {}),
     // Preserve the caller's key when present (a genuine Codex request already
     // carries a stable per-thread one); otherwise synthesize one off the
@@ -738,7 +835,12 @@ export const toChatGptRequest = (
     ),
     ...(responsesTools !== undefined ? { tools: responsesTools } : {}),
     ...(req.tool_choice !== undefined
-      ? { tool_choice: toResponsesToolChoice(req.tool_choice) }
+      ? {
+          tool_choice: toResponsesToolChoice(
+            req.tool_choice,
+            toolNameMaps.outbound,
+          ),
+        }
       : {}),
     ...(() => {
       // Non-Codex Responses upstreams only (grok): the Codex backend 400s

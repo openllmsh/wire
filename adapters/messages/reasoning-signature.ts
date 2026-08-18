@@ -38,7 +38,7 @@ export type TReasoningItem = {
 // runtime-only: a `reasoning` item in the Responses API `input` array.
 export type TReasoningResponsesInput = {
   readonly type: "reasoning";
-  readonly id: string;
+  readonly id?: string;
   readonly summary: ReadonlyArray<TReasoningSummaryPart>;
   readonly encrypted_content?: string;
 };
@@ -171,16 +171,26 @@ export const decodeReasoningSignature = (
  * Convert a stored reasoning item back to a Responses API `input` item.
  * Mirrors litellm `_reasoning_item_to_response_input`: `summary` is
  * always required (even empty); `encrypted_content` is only sent when
- * present.
+ * present. The ChatGPT/Codex encoder always sends `store: false`, so an
+ * item without resumable ciphertext must not name an unpersisted item via
+ * `id` (the upstream rejects that combination).
  */
 export const reasoningItemToResponsesInput = (
   item: TReasoningItem,
-): TReasoningResponsesInput => ({
-  type: "reasoning",
-  id: item.id.length > 0 ? item.id : `rs_${crypto.randomUUID()}`,
-  summary: item.summary,
-  ...(typeof item.encrypted_content === "string" &&
-  item.encrypted_content.length > 0
-    ? { encrypted_content: item.encrypted_content }
-    : {}),
-});
+): TReasoningResponsesInput => {
+  const encryptedContent =
+    typeof item.encrypted_content === "string" &&
+    item.encrypted_content.length > 0
+      ? item.encrypted_content
+      : null;
+  return {
+    type: "reasoning",
+    summary: item.summary,
+    ...(encryptedContent !== null
+      ? {
+          id: item.id.length > 0 ? item.id : `rs_${crypto.randomUUID()}`,
+          encrypted_content: encryptedContent,
+        }
+      : {}),
+  };
+};

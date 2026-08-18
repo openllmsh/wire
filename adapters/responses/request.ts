@@ -121,10 +121,12 @@ export const fromResponsesRequest = (
 ): TChatCompletionRequest => {
   const messages: TChatMessage[] = [];
   // Codex v0.147 moves its namespace-scoped harness tools into leading
-  // `additional_tools` input items. Keep all Responses-native tools opaque for
-  // the ChatGPT Responses hop; only flat top-level functions map to canonical
-  // `tools` for cross-wire providers.
+  // `additional_tools` input items. Keep top-level Responses tools and those
+  // leading input items as DISTINCT opaque carriers: their placement changes
+  // the ChatGPT/Codex upstream contract. Only flat top-level functions map to
+  // canonical `tools` for cross-wire providers.
   const responsesTools = req.tools == null ? [] : [...req.tools];
+  const responsesAdditionalTools: unknown[] = [];
 
   const instr = req.instructions;
   if (typeof instr === "string" && instr.trim().length > 0) {
@@ -148,7 +150,10 @@ export const fromResponsesRequest = (
       if (item.type === "reasoning") {
         pendingReasoning.push(item);
       } else if (item.type === "additional_tools") {
-        responsesTools.push(...item.tools);
+        // Preserve the entire input item rather than hoisting its nested tools.
+        // The Codex upstream distinguishes harness declarations in input from
+        // model-facing tools at the top level.
+        responsesAdditionalTools.push(item);
       } else if (item.type === "function_call") {
         const toolCall: TToolCall = {
           id: item.call_id,
@@ -197,6 +202,12 @@ export const fromResponsesRequest = (
     // a chatgpt upstream re-emits Codex's apply_patch / web_search / … intact.
     // Stripped before every openai-family upstream. See the schema field doc.
     ...(responsesTools.length > 0 ? { responses_tools: responsesTools } : {}),
+    ...(responsesAdditionalTools.length > 0
+      ? { responses_additional_tools: responsesAdditionalTools }
+      : {}),
+    ...(req.client_metadata !== undefined
+      ? { responses_client_metadata: req.client_metadata }
+      : {}),
     ...(toolChoice !== undefined ? { tool_choice: toolChoice } : {}),
     ...(effort !== undefined ? { reasoning_effort: effort } : {}),
     ...(req.max_output_tokens != null

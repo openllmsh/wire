@@ -27,7 +27,11 @@ export const toResponsesResponse = (
 
   if (msg?.reasoning_items != null) {
     for (const r of reasoningItemsFromUnknown(msg.reasoning_items)) {
-      output.push(reasoningItemToResponsesInput(r));
+      const item = reasoningItemToResponsesInput(r);
+      output.push({
+        ...item,
+        id: item.id ?? (r.id.length > 0 ? r.id : `rs_${crypto.randomUUID()}`),
+      });
     }
   }
 
