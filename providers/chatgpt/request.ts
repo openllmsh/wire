@@ -13,6 +13,7 @@ import { extractMessageText } from "../../lib/canonical/message";
 const CHATGPT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 const CHATGPT_NAME_SUB_RE = /[^a-zA-Z0-9_-]/g;
 const COLLAPSE_UNDERSCORE_RE = /_+/g;
+const CODEX_IDENTIFIER_MAX_LENGTH = 64;
 
 /**
  * A stable, deterministic 64-bit hash (two FNV-1a passes with distinct offset
@@ -82,18 +83,44 @@ const clampPromptCacheKey = (key: string): string => {
 };
 
 /**
- * Coerce a `name` field to match `^[a-zA-Z0-9_-]+$`. ChatGPT 400s on
- * any other character with a `pattern` error which triggers a retry
- * spiral. Mirrors `chat/transformation.py:64-79`.
+ * Clamp a Codex tool identifier to the Responses backend's 64-character
+ * bound. Long values retain a 47-character prefix and gain a `_` plus the
+ * stable 16-hex digest of the complete original value, making the result
+ * deterministic and collision-resistant without changing short identifiers.
+ */
+const clampCodexIdentifier = (value: string): string => {
+  if (value.length <= CODEX_IDENTIFIER_MAX_LENGTH) return value;
+  const suffix = `_${stableHash(value)}`;
+  return `${value.slice(0, CODEX_IDENTIFIER_MAX_LENGTH - suffix.length)}${suffix}`;
+};
+
+/**
+ * Coerce a `name` field to match `^[a-zA-Z0-9_-]+$`, then clamp it to the
+ * Codex Responses backend's 64-character limit. ChatGPT 400s on any other
+ * character with a `pattern` error which triggers a retry spiral. Mirrors
+ * `chat/transformation.py:64-79`.
+ *
+ * The stream decoder currently receives provider options but not the original
+ * request, so it cannot reverse this lossy shortening before emitting a model
+ * tool call. A request-scoped reverse map must accompany a future stream-state
+ * lifecycle change; do not assume a shortened model tool name is client-ready.
  */
 const sanitizeName = (name: string): string => {
-  if (name === "" || CHATGPT_NAME_RE.test(name)) return name;
+  if (name === "" || CHATGPT_NAME_RE.test(name)) {
+    return clampCodexIdentifier(name);
+  }
   const cleaned = name
     .replace(CHATGPT_NAME_SUB_RE, "_")
     .replace(COLLAPSE_UNDERSCORE_RE, "_")
     .replace(/^_+|_+$/g, "");
-  return cleaned.length > 0 ? cleaned : "tool";
+  return clampCodexIdentifier(cleaned.length > 0 ? cleaned : "tool");
 };
+
+/** Call IDs do not share tool-name charset constraints, only the 64-character
+ * Responses API length limit. Applying the same pure clamp on both the prior
+ * function call and its tool result preserves their pairing. */
+const clampCodexCallId = (callId: string): string =>
+  clampCodexIdentifier(callId);
 
 // runtime-only: a single Responses API content part. The input/output
 // distinction matters — the chatgpt.com endpoint rejects an
@@ -291,7 +318,11 @@ const toolResultToItems = (
           ? "(see attached image)"
           : "";
   const items: TResponsesInputItem[] = [
-    { type: "function_call_output", call_id: msg.tool_call_id, output },
+    {
+      type: "function_call_output",
+      call_id: clampCodexCallId(msg.tool_call_id),
+      output,
+    },
   ];
   if (images.length > 0) {
     items.push({
@@ -361,7 +392,7 @@ const messagesToInputItems = (
         for (const call of toolCalls) {
           items.push({
             type: "function_call",
-            call_id: call.id,
+            call_id: clampCodexCallId(call.id),
             name: sanitizeName(call.function.name),
             arguments: call.function.arguments,
           });
@@ -474,11 +505,18 @@ const toolsToResponses = (
 const sanitizeResponsesTools = (
   tools: ReadonlyArray<TResponsesPassthroughToolDef>,
 ): ReadonlyArray<TResponsesPassthroughToolDef> =>
-  tools.map((tool) =>
-    tool.type === "function" && "parameters" in tool
-      ? { ...tool, parameters: sanitizeToolParameters(tool.parameters) }
-      : tool,
-  );
+  tools.map((tool) => {
+    if (tool.type !== "function") return tool;
+    return {
+      ...tool,
+      ...(typeof tool.name === "string"
+        ? { name: sanitizeName(tool.name) }
+        : {}),
+      ...("parameters" in tool
+        ? { parameters: sanitizeToolParameters(tool.parameters) }
+        : {}),
+    };
+  });
 
 // runtime-only: tool_choice in the Responses API. Mirrors the tools
 // shape — FLAT `{type:"function", name}`, NOT the chat-completions
