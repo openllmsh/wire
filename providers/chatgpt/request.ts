@@ -3,10 +3,10 @@ import type {
   TChatGptProviderOptions,
   TChatMessage,
 } from "@openllmsh/protocol";
+import type { TReasoningResponsesInput } from "../../adapters/messages/reasoning-signature";
 import {
   reasoningItemsFromUnknown,
   reasoningItemToResponsesInput,
-  type TReasoningResponsesInput,
 } from "../../adapters/messages/reasoning-signature";
 import { extractMessageText } from "../../lib/canonical/message";
 
@@ -100,10 +100,8 @@ const clampCodexIdentifier = (value: string): string => {
  * character with a `pattern` error which triggers a retry spiral. Mirrors
  * `chat/transformation.py:64-79`.
  *
- * The stream decoder currently receives provider options but not the original
- * request, so it cannot reverse this lossy shortening before emitting a model
- * tool call. A request-scoped reverse map must accompany a future stream-state
- * lifecycle change; do not assume a shortened model tool name is client-ready.
+ * A request-scoped reverse map built by {@link buildChatGptToolNameMap} restores
+ * any lossy rewrite before the streaming decoder emits a client tool call.
  */
 const sanitizeName = (name: string): string => {
   if (name === "" || CHATGPT_NAME_RE.test(name)) {
@@ -477,6 +475,89 @@ type TResponsesPassthroughToolDef = {
   readonly [key: string]: unknown;
 };
 
+const EMPTY_TOOL_NAME_MAP: ReadonlyMap<string, string> = new Map();
+
+/** A deterministic request-build failure: two client tools would become one
+ * Responses tool after the required Codex name sanitation. */
+export class ChatGptToolNameCollisionError extends Error {
+  readonly type = "tool_name_collision";
+
+  constructor(
+    readonly sanitizedName: string,
+    readonly firstOriginalName: string,
+    readonly secondOriginalName: string,
+  ) {
+    super(
+      `ChatGPT tool-name collision: ${JSON.stringify(firstOriginalName)} and ${JSON.stringify(secondOriginalName)} both sanitize to ${JSON.stringify(sanitizedName)}`,
+    );
+    this.name = "ChatGptToolNameCollisionError";
+  }
+}
+
+const functionResponsesToolName = (tool: unknown): string | undefined => {
+  if (tool === null || typeof tool !== "object" || Array.isArray(tool)) {
+    return undefined;
+  }
+  const record = tool as Record<string, unknown>;
+  return record.type === "function" && typeof record.name === "string"
+    ? record.name
+    : undefined;
+};
+
+/**
+ * Build the request-scoped reverse mapping the Responses stream needs to put
+ * every client tool name back exactly as it was sent to OpenLLM. Only lossy
+ * rewrites are retained, so normal valid <=64-character names share the empty
+ * map and add no stream-state or decoder work.
+ *
+ * Both canonical `tools` and opaque Responses `responses_tools` participate in
+ * collision detection. The latter wins when emitted, but accepting an ambiguous
+ * canonical request would make a later representation change unsafe.
+ */
+const forEachFunctionToolName = (
+  req: Pick<TChatCompletionRequest, "tools" | "responses_tools">,
+  visit: (name: string) => void,
+): void => {
+  for (const tool of req.tools ?? []) visit(tool.function.name);
+  for (const tool of req.responses_tools ?? []) {
+    const name = functionResponsesToolName(tool);
+    if (name !== undefined) visit(name);
+  }
+};
+
+export const buildChatGptToolNameMap = (
+  req: Pick<TChatCompletionRequest, "tools" | "responses_tools">,
+): ReadonlyMap<string, string> => {
+  // Avoid even a per-request Map allocation in the overwhelmingly common clean
+  // case. A collision needs at least one lossy rewrite, so only that path needs
+  // a second pass to retain every sanitized name for collision detection.
+  let hasLossyRewrite = false;
+  forEachFunctionToolName(req, (name) => {
+    if (sanitizeName(name) !== name) hasLossyRewrite = true;
+  });
+  if (!hasLossyRewrite) return EMPTY_TOOL_NAME_MAP;
+
+  const originalBySanitized = new Map<string, string>();
+  const reverseMap = new Map<string, string>();
+  forEachFunctionToolName(req, (originalName) => {
+    const sanitizedName = sanitizeName(originalName);
+    const existing = originalBySanitized.get(sanitizedName);
+    if (existing !== undefined && existing !== originalName) {
+      throw new ChatGptToolNameCollisionError(
+        sanitizedName,
+        existing,
+        originalName,
+      );
+    }
+    originalBySanitized.set(sanitizedName, originalName);
+    if (sanitizedName !== originalName) {
+      reverseMap.set(sanitizedName, originalName);
+    }
+  });
+
+  return reverseMap;
+};
+
 const toolsToResponses = (
   tools: NonNullable<TChatCompletionRequest["tools"]>,
 ): TResponsesToolDef[] =>
@@ -617,6 +698,10 @@ export const toChatGptRequest = (
     req.messages,
   );
   const input = messagesToInputItems(req.messages);
+  // Validate every function tool before assembling the outbound body. A collision
+  // would make the upstream tool namespace ambiguous and cannot be reversed on
+  // the stream back to the client.
+  buildChatGptToolNameMap(req);
   // Prefer the verbatim `responses_tools` passthrough (Codex's full original
   // tool set, function + non-function) — it round-trips apply_patch /
   // web_search / image_generation / tool_search intact to the same endpoint

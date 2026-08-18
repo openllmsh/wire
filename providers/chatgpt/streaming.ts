@@ -3,10 +3,8 @@ import type {
   TChatGptProviderOptions,
   TServerSearchCall,
 } from "@openllmsh/protocol";
-import {
-  buildReasoningItem,
-  type TReasoningItem,
-} from "../../adapters/messages/reasoning-signature";
+import type { TReasoningItem } from "../../adapters/messages/reasoning-signature";
+import { buildReasoningItem } from "../../adapters/messages/reasoning-signature";
 import { UpstreamStreamError } from "../../lib/streaming/upstream-error";
 
 // runtime-only: Responses API events arrive as freeform JSON dicts. We
@@ -38,6 +36,12 @@ export type TChatGptStreamEvent = Record<string, unknown>;
 // responses that omit per-item `.done`. `emittedReasoningIds` dedupes so
 // a given item round-trips exactly once. Mirrors litellm
 // `transformation.py:1321-1356`.
+/** Runtime-only options that accompany a ChatGPT stream after request encoding. */
+export type TChatGptStreamOptions = TChatGptProviderOptions & {
+  /** Lossy outbound tool-name rewrites, keyed by the name Responses emits. */
+  readonly toolNameMap?: ReadonlyMap<string, string>;
+};
+
 export type TChatGptStreamState = {
   hasToolCall: boolean;
   reasoningItems: Map<string, TReasoningItem>;
@@ -68,10 +72,12 @@ export type TChatGptStreamState = {
       results: ReadonlyArray<{ url: string }>;
     }
   >;
+  /** Present only when request encoding had to rewrite a client tool name. */
+  readonly toolNameMap?: ReadonlyMap<string, string>;
 };
 
 export const newChatGptStreamState = (
-  _options: TChatGptProviderOptions,
+  options: TChatGptStreamOptions,
 ): TChatGptStreamState => ({
   hasToolCall: false,
   reasoningItems: new Map(),
@@ -79,6 +85,9 @@ export const newChatGptStreamState = (
   argsStreamedIndexes: new Set(),
   argsFinalizedIndexes: new Set(),
   serverSearchById: new Map(),
+  ...(options.toolNameMap !== undefined && options.toolNameMap.size > 0
+    ? { toolNameMap: options.toolNameMap }
+    : {}),
 });
 
 /**
@@ -90,7 +99,7 @@ const finalizeToolArgs = (
   state: TChatGptStreamState,
   outputIndex: number,
   args: string,
-  options: TChatGptProviderOptions,
+  options: TChatGptStreamOptions,
 ): TChatCompletionChunk | null => {
   if (
     args.length === 0 ||
@@ -153,7 +162,7 @@ const drainUnemittedReasoning = (
 };
 
 const baseChunk = (
-  options: TChatGptProviderOptions,
+  options: TChatGptStreamOptions,
 ): Pick<TChatCompletionChunk, "id" | "object" | "created" | "model"> => ({
   id: `chatcmpl-${crypto.randomUUID()}`,
   object: "chat.completion.chunk",
@@ -386,7 +395,7 @@ const toolCallArguments = (item: Record<string, unknown>): string => {
 const terminalChunk = (
   response: Record<string, unknown> | undefined,
   state: TChatGptStreamState,
-  options: TChatGptProviderOptions,
+  options: TChatGptStreamOptions,
   truncated: boolean,
 ): TChatCompletionChunk => {
   // Prefer per-stream state: we already counted every
@@ -503,7 +512,7 @@ const terminalChunk = (
 export const chatGptEventToChunk = (
   event: TChatGptStreamEvent,
   state: TChatGptStreamState,
-  options: TChatGptProviderOptions,
+  options: TChatGptStreamOptions,
 ): TChatCompletionChunk | null => {
   const type = stringField(event, "type");
   if (type === undefined) return null;
@@ -686,7 +695,11 @@ export const chatGptEventToChunk = (
     if (!isToolCallItem(item)) return null;
     state.hasToolCall = true;
     const callId = toolCallId(item);
-    const name = toolCallName(item);
+    const emittedName = toolCallName(item);
+    const name =
+      emittedName !== undefined
+        ? (state.toolNameMap?.get(emittedName) ?? emittedName)
+        : undefined;
     const outputIndex = numberField(event, "output_index") ?? 0;
     return {
       ...baseChunk(options),
