@@ -585,22 +585,25 @@ const lastResponsesUserIndex = (input: ReadonlyArray<unknown>): number =>
  * nothing more can go. Preserves the last user `message` (the live query) and
  * `function_call` ↔ `function_call_output` pairing (dropping a `function_call`
  * takes its matching `function_call_output` with it, and vice-versa), so the
- * upstream never sees an orphaned call or output. Leading `message` items with
- * `role:"system"`/`"developer"` (the instructions prefix) are never dropped.
+ * upstream never sees an orphaned call or output. Leading instruction `message`
+ * items and `additional_tools` declarations are never dropped.
  */
 const dropOldestResponsesItems = (
   input: ReadonlyArray<unknown>,
   fits: (items: ReadonlyArray<unknown>) => boolean,
 ): unknown[] => {
   const survivors = [...input];
-  // Skip a leading system/developer instructions prefix.
+  // Preserve leading non-turn state: system/developer instructions and Codex's
+  // v0.147 `additional_tools` declarations must survive any retry, otherwise
+  // the remaining conversation can reference tools the upstream no longer has.
   let start = 0;
   while (start < survivors.length) {
-    const it = survivors[start];
+    const item = survivors[start];
     if (
-      isRecord(it) &&
-      it.type === "message" &&
-      (it.role === "system" || it.role === "developer")
+      isRecord(item) &&
+      (item.type === "additional_tools" ||
+        (item.type === "message" &&
+          (item.role === "system" || item.role === "developer")))
     ) {
       start++;
       continue;

@@ -518,6 +518,9 @@ export type TChatGptRequestBody = {
   readonly stream: true;
   readonly store: false;
   readonly include: ReadonlyArray<string>;
+  // Codex Responses-Lite requires `parallel_tool_calls` to be false; this is
+  // the native setting on codex v0.147 responses paths.
+  readonly parallel_tool_calls?: boolean;
   // The client's token cap — emitted ONLY on the non-Codex Responses
   // variant (`codexInstructions: false`, i.e. grok), where the chat proxy
   // honors it as a hard cap (verified live 2026-07-14). The chatgpt.com
@@ -531,9 +534,13 @@ export type TChatGptRequestBody = {
   // `summary: "auto"` rides with every effort — Codex itself sends it, the
   // Grok proxy accepts it (verified live), and the stream decoder already
   // maps `response.reasoning_summary_text.delta` → `reasoning_content`.
+  // `context: "all_turns"` is REQUIRED by the ChatGPT Codex "Responses-Lite"
+  // backend (gpt-5.6-terra/luna) and sent natively by codex v0.147. Codex path
+  // only — the Grok chat proxy rejects it, so it's omitted there.
   readonly reasoning?: {
     readonly effort: "low" | "medium" | "high";
     readonly summary: "auto";
+    readonly context?: "all_turns";
   };
   readonly previous_response_id?: string;
   readonly truncation?: "auto" | "disabled";
@@ -595,6 +602,9 @@ export const toChatGptRequest = (
     stream: true,
     store: false,
     include: ["reasoning.encrypted_content"],
+    ...(options.codexInstructions !== false
+      ? { parallel_tool_calls: false }
+      : {}),
     // Preserve the caller's key when present (a genuine Codex request already
     // carries a stable per-thread one); otherwise synthesize one off the
     // conversation prefix so turns of the same conversation share a cache lane.
@@ -627,7 +637,15 @@ export const toChatGptRequest = (
           : e === "medium"
             ? "medium"
             : "high";
-      return { reasoning: { effort, summary: "auto" as const } };
+      return {
+        reasoning: {
+          effort,
+          summary: "auto" as const,
+          ...(options.codexInstructions !== false
+            ? { context: "all_turns" as const }
+            : {}),
+        },
+      };
     })(),
   };
 };

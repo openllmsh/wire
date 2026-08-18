@@ -22,6 +22,8 @@ import type { TCanonicalContentPart } from "../../lib/canonical/content-part";
  *  - `input` item `function_call_output` → a `tool` message.
  *  - `input` item `reasoning`  → carried onto the NEXT assistant message's
  *                                `reasoning_items` so it round-trips.
+ *  - `input` item `additional_tools` → opaque Responses-tool passthrough only
+ *                                (never a canonical message).
  *  - flat `tools`/`tool_choice` → canonical wrapped shapes.
  *  - `reasoning.effort` → `reasoning_effort`; `max_output_tokens` → `max_tokens`.
  */
@@ -118,6 +120,11 @@ export const fromResponsesRequest = (
   req: TResponsesRequest,
 ): TChatCompletionRequest => {
   const messages: TChatMessage[] = [];
+  // Codex v0.147 moves its namespace-scoped harness tools into leading
+  // `additional_tools` input items. Keep all Responses-native tools opaque for
+  // the ChatGPT Responses hop; only flat top-level functions map to canonical
+  // `tools` for cross-wire providers.
+  const responsesTools = req.tools == null ? [] : [...req.tools];
 
   const instr = req.instructions;
   if (typeof instr === "string" && instr.trim().length > 0) {
@@ -140,6 +147,8 @@ export const fromResponsesRequest = (
     for (const item of req.input) {
       if (item.type === "reasoning") {
         pendingReasoning.push(item);
+      } else if (item.type === "additional_tools") {
+        responsesTools.push(...item.tools);
       } else if (item.type === "function_call") {
         const toolCall: TToolCall = {
           id: item.call_id,
@@ -187,9 +196,7 @@ export const fromResponsesRequest = (
     // Carry the ORIGINAL Responses tools verbatim (function + non-function) so
     // a chatgpt upstream re-emits Codex's apply_patch / web_search / … intact.
     // Stripped before every openai-family upstream. See the schema field doc.
-    ...(req.tools != null && req.tools.length > 0
-      ? { responses_tools: req.tools }
-      : {}),
+    ...(responsesTools.length > 0 ? { responses_tools: responsesTools } : {}),
     ...(toolChoice !== undefined ? { tool_choice: toolChoice } : {}),
     ...(effort !== undefined ? { reasoning_effort: effort } : {}),
     ...(req.max_output_tokens != null
