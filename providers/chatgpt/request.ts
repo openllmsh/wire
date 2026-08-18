@@ -676,6 +676,14 @@ const toResponsesToolChoice = (
  * tiers are deliberately NOT used — both Lite and full Responses can serve the
  * same catalog ids.
  */
+// The Codex "spark" family (e.g. `gpt-5.3-codex-spark`) rejects
+// `reasoning.context: "all_turns"` with a 400 — it only accepts `auto` and
+// `current_turn`. Every other Codex model requires `all_turns`. Detect spark
+// by model-id suffix (mirrors CLIProxyAPI's `strings.HasSuffix(baseModel,
+// "spark")`) and omit `context` for it, falling back to the backend default.
+const isCodexSparkModel = (modelId: string): boolean =>
+  modelId.toLowerCase().endsWith("spark");
+
 const isCodexResponsesLite = (clientMetadata: unknown): boolean => {
   if (
     clientMetadata === null ||
@@ -733,7 +741,9 @@ export type TChatGptRequestBody = {
   // maps `response.reasoning_summary_text.delta` → `reasoning_content`.
   // `context: "all_turns"` is REQUIRED by the ChatGPT Codex "Responses-Lite"
   // backend (gpt-5.6-terra/luna) and sent natively by codex v0.147. Codex path
-  // only — the Grok chat proxy rejects it, so it's omitted there.
+  // only — the Grok chat proxy rejects it, so it's omitted there. The Codex
+  // `spark` family also rejects it (only `auto`/`current_turn`), so it's
+  // omitted for spark too — see `isCodexSparkModel`.
   readonly reasoning?: {
     readonly effort: "low" | "medium" | "high";
     readonly summary: "auto";
@@ -866,7 +876,10 @@ export const toChatGptRequest = (
         reasoning: {
           effort,
           summary: "auto" as const,
-          ...(options.codexInstructions !== false
+          // Codex path requires `context: "all_turns"`, except the spark
+          // family which 400s on it (accepts only `auto`/`current_turn`).
+          ...(options.codexInstructions !== false &&
+          !isCodexSparkModel(options.providerModelId)
             ? { context: "all_turns" as const }
             : {}),
         },
