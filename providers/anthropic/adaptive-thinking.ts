@@ -36,6 +36,20 @@ export const EFFORT_TO_BUDGET_TOKENS = {
 } as const;
 export type TReasoningEffort = keyof typeof EFFORT_TO_BUDGET_TOKENS;
 
+/** Map an Anthropic `thinking` budget to the canonical effort enum (flooring to `minimal`). */
+export const budgetToReasoningEffort = (
+  budgetTokens: number,
+): TReasoningEffort => {
+  let effort: TReasoningEffort = "minimal";
+  for (const [nextEffort, budget] of Object.entries(EFFORT_TO_BUDGET_TOKENS)) {
+    const mappedEffort = readEffort(nextEffort);
+    if (budgetTokens >= budget && mappedEffort !== undefined) {
+      effort = mappedEffort;
+    }
+  }
+  return effort;
+};
+
 /**
  * OpenAI-style `reasoning_effort` → Anthropic `output_config.effort`
  * map. Mirrors LiteLLM's `REASONING_EFFORT_TO_OUTPUT_CONFIG_EFFORT` —

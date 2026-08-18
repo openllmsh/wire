@@ -496,10 +496,10 @@ export const chunkToMessagesEvents = (
   // tail into the ledger. Do not dump as `text` here — signed hops
   // emit it as `thinking_delta` with the signature; unsigned hops
   // flush at content / finish (compaction-safe).
-  if (
-    fromReasoningItems.length > state.thinkingAccumulated.length &&
-    fromReasoningItems.startsWith(state.thinkingAccumulated)
-  ) {
+  // Reasoning item summaries are authoritative even when they are not a
+  // prefix of the folded streamed delta (e.g. snapshot collapse) — accept a
+  // longer snapshot whenever it grows.
+  if (fromReasoningItems.length > state.thinkingAccumulated.length) {
     state.thinkingAccumulated = fromReasoningItems;
   }
 

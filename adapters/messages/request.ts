@@ -8,7 +8,23 @@ import type {
   TToolCall,
 } from "@openllmsh/protocol";
 import type { TCanonicalContentPart } from "../../lib/canonical/content-part";
+import { budgetToReasoningEffort } from "../../providers/anthropic/adaptive-thinking";
 import { decodeReasoningSignature } from "./reasoning-signature";
+
+const reasonEffortFromThinking = (
+  req: TAnthropicRequest,
+): TChatCompletionRequest["reasoning_effort"] => {
+  if (req.output_config?.effort !== undefined) {
+    return req.output_config.effort;
+  }
+  if (req.thinking?.type === "enabled") {
+    return budgetToReasoningEffort(req.thinking.budget_tokens);
+  }
+  if (req.thinking?.type === "adaptive") {
+    return req.output_config?.effort ?? "medium";
+  }
+  return undefined;
+};
 
 const extractTextFromBlocks = (
   blocks: ReadonlyArray<TAnthropicContentBlock>,
@@ -454,6 +470,8 @@ export const fromAnthropicMessagesRequest = (
       ? anthropicToolChoiceToOpenAI(req.tool_choice)
       : undefined;
 
+  const reasoningEffort = reasonEffortFromThinking(req);
+
   return {
     model: req.model,
     messages,
@@ -466,6 +484,9 @@ export const fromAnthropicMessagesRequest = (
     ...(req.stream !== undefined ? { stream: req.stream } : {}),
     ...(tools !== undefined && tools.length > 0 ? { tools } : {}),
     ...(toolChoice !== undefined ? { tool_choice: toolChoice } : {}),
+    ...(reasoningEffort !== undefined
+      ? { reasoning_effort: reasoningEffort }
+      : {}),
     ...(req.metadata?.user_id !== undefined
       ? { user: req.metadata.user_id }
       : {}),
