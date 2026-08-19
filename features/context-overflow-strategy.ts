@@ -17,10 +17,10 @@ export const resolveContextOverflowStrategy = (
     ? "compact_in_place"
     : DEFAULT_CONTEXT_OVERFLOW_STRATEGY;
 
-export const shouldDemoteOnContextOverflow = (
+/** Hop mode both demotes on overflow and pre-skips known-too-small hops. */
+export const isHopToLargerContext = (
   strategy: TContextOverflowStrategy,
 ): boolean => strategy === "hop_to_larger_context";
 
-export const shouldSkipHopForSize = (
-  strategy: TContextOverflowStrategy,
-): boolean => strategy === "hop_to_larger_context";
+export const shouldDemoteOnContextOverflow = isHopToLargerContext;
+export const shouldSkipHopForSize = isHopToLargerContext;
