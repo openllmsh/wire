@@ -15,6 +15,7 @@ export * from "./adapters/messages/streaming";
 export * from "./features/compaction/compact-request";
 export * from "./features/compaction/compaction-text";
 export * from "./features/context-demote";
+export * from "./features/context-overflow-strategy";
 export * from "./features/context-skip";
 export * from "./features/max-tokens-backfill";
 export * from "./features/quota-gate";
