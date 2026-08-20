@@ -41,7 +41,7 @@ import { toAnthropicMessagesResponse } from "@openllmsh/wire/adapters/messages/r
 ## License
 
 **Source-available** under the [Business Source License 1.1](./LICENSE)
-(© Quantide LLC) — use it freely except to run a competing hosted service;
+(© OpenLLM, INC) — use it freely except to run a competing hosted service;
 converts to MIT on the Change Date. This is not OSI open-source.
 
 ---
