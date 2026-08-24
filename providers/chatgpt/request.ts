@@ -9,6 +9,7 @@ import {
   reasoningItemToResponsesInput,
 } from "../../adapters/messages/reasoning-signature";
 import { extractMessageText } from "../../lib/canonical/message";
+import { effectiveDeny, responsesWirePolicy } from "../upstream-deny";
 
 const CHATGPT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
 const CHATGPT_NAME_SUB_RE = /[^a-zA-Z0-9_-]/g;
@@ -730,8 +731,11 @@ export type TChatGptRequestBody = {
   // variant (`codexInstructions: false`, i.e. grok), where the chat proxy
   // honors it as a hard cap (verified live 2026-07-14). The chatgpt.com
   // Codex endpoint rejects it (`Unsupported parameter: max_output_tokens`),
-  // so Codex hops keep dropping it.
+  // so Codex hops keep dropping it. Grok also allow-backs temperature/top_p
+  // (same live verify); both stay off the Codex body via WIRE_DENY.chatgpt.
   readonly max_output_tokens?: number;
+  readonly temperature?: number;
+  readonly top_p?: number;
   readonly tools?: ReadonlyArray<
     TResponsesToolDef | TResponsesPassthroughToolDef
   >;
@@ -853,11 +857,31 @@ export const toChatGptRequest = (
         }
       : {}),
     ...(() => {
-      // Non-Codex Responses upstreams only (grok): the Codex backend 400s
-      // on the field, the Grok chat proxy honors it (see the type comment).
-      if (options.codexInstructions !== false) return {};
-      const cap = req.max_completion_tokens ?? req.max_tokens;
-      return cap !== undefined ? { max_output_tokens: cap } : {};
+      // Axis 1+2: Codex keeps the full WIRE_DENY.chatgpt drop set (body
+      // byte-identical). Grok (`codexInstructions: false`) allow-backs
+      // temperature / top_p / max_output_tokens. Map the OpenAI cap aliases
+      // onto max_output_tokens; keep response_format / stop / seed / top_k
+      // denied.
+      const deny = effectiveDeny(
+        "chatgpt",
+        responsesWirePolicy(options.codexInstructions),
+      );
+      const extra: {
+        temperature?: number;
+        top_p?: number;
+        max_output_tokens?: number;
+      } = {};
+      if (!deny.has("temperature") && req.temperature !== undefined) {
+        extra.temperature = req.temperature;
+      }
+      if (!deny.has("top_p") && req.top_p !== undefined) {
+        extra.top_p = req.top_p;
+      }
+      if (!deny.has("max_output_tokens")) {
+        const cap = req.max_completion_tokens ?? req.max_tokens;
+        if (cap !== undefined) extra.max_output_tokens = cap;
+      }
+      return extra;
     })(),
     ...(() => {
       // ChatGPT's Responses API only accepts `low | medium | high`.
