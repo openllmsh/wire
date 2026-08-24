@@ -1,7 +1,7 @@
 /**
  * Raise-only output-token backfill — the shared rule the cloud dispatch
  * chain and the coreless daemon walker both apply so an alias / binding
- * / pin that resolves to a concrete model gets that model's catalog
+ * / pin that resolves to a concrete model gets its live vendor-reported
  * ceiling instead of the client's conservative default for the
  * unrecognised alias id.
  *
