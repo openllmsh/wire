@@ -18,6 +18,7 @@ export * from "./features/context-demote";
 export * from "./features/context-overflow-strategy";
 export * from "./features/context-skip";
 export * from "./features/max-tokens-backfill";
+export * from "./features/model-caps";
 export * from "./features/quota-gate";
 export * from "./lib/canonical/content-part";
 export * from "./lib/canonical/message";
