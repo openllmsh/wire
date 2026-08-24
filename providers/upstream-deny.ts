@@ -78,8 +78,10 @@ export const applyProviderPolicy = (
   const aliases = policy?.aliases;
   if (aliases !== undefined) {
     for (const [from, to] of Object.entries(aliases)) {
-      if (Object.hasOwn(filtered, from) && !Object.hasOwn(filtered, to)) {
-        filtered[to] = filtered[from];
+      if (Object.hasOwn(filtered, from)) {
+        if (!Object.hasOwn(filtered, to)) {
+          filtered[to] = filtered[from];
+        }
         delete filtered[from];
       }
     }

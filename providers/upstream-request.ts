@@ -14,10 +14,7 @@ import {
 } from "./anthropic/beta-headers";
 import { toAnthropicRequest } from "./anthropic/request";
 import { deriveChatGptSessionId, toChatGptRequest } from "./chatgpt/request";
-import {
-  applyProviderPolicy,
-  PROVIDER_POLICY,
-} from "./upstream-deny";
+import { applyProviderPolicy, PROVIDER_POLICY } from "./upstream-deny";
 
 /**
  * The SINGLE recipe for preparing an upstream provider request from an inbound
@@ -261,7 +258,12 @@ export const buildUpstreamBody = (
     };
     return upstreamWire === "anthropic"
       ? normaliseAdaptiveThinking(hoistInlineAnthropicSystemMessages(pinned))
-      : pinned;
+      : upstreamWire === "openai"
+        ? applyProviderPolicy(
+            pinned,
+            PROVIDER_POLICY[providerModelId.split("/")[0]],
+          )
+        : pinned;
   }
   // Cross-wire: route through canonical, then encode to the upstream's wire.
   return canonicalToUpstreamBody(

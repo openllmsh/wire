@@ -1,13 +1,12 @@
+import type { TModelCaps } from "@openllmsh/protocol";
+
+export type { TModelCaps };
+
 /**
  * Catalog-declared, model-family request constraints. These run after wire
  * encoding so the resolved model card can make the final provider-specific
  * adjustment without teaching a wire format about model names.
  */
-export type TModelCaps = {
-  readonly deniedParams?: readonly string[];
-  readonly maxTokensField?: "max_tokens" | "max_completion_tokens";
-  readonly temperature?: "only-1" | "clamp-0-1" | "drop";
-};
 
 const otherMaxTokensField = (
   field: NonNullable<TModelCaps["maxTokensField"]>,
