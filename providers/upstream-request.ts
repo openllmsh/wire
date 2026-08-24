@@ -167,6 +167,7 @@ const hoistInlineAnthropicSystemMessages = (
 export const canonicalToUpstreamBody = (
   upstreamWire: TUpstreamWire,
   canonical: TChatCompletionRequest,
+  provider: string,
   providerModelId: string,
   stream: boolean,
   // Whether the chatgpt (Responses) encode injects the Codex preamble. Undefined
@@ -201,7 +202,7 @@ export const canonicalToUpstreamBody = (
       model: providerModelId,
       stream,
     },
-    PROVIDER_POLICY[providerModelId.split("/")[0]],
+    PROVIDER_POLICY[provider],
   );
 
   return openaiWithPolicy;
@@ -215,6 +216,7 @@ export const buildUpstreamBody = (
   surface: TClientSurface,
   upstreamWire: TUpstreamWire,
   rawBody: unknown,
+  provider: string,
   providerModelId: string,
   // `undefined` → PRESERVE the body's own stream flag (the cloud passthrough
   // forwards verbatim); a boolean pins it (the daemon, off the 307's intent).
@@ -261,7 +263,7 @@ export const buildUpstreamBody = (
       : upstreamWire === "openai"
         ? applyProviderPolicy(
             pinned,
-            PROVIDER_POLICY[providerModelId.split("/")[0]],
+            PROVIDER_POLICY[provider],
           )
         : pinned;
   }
@@ -269,6 +271,7 @@ export const buildUpstreamBody = (
   return canonicalToUpstreamBody(
     upstreamWire,
     canonicalFromInbound(surface, rawBody),
+    provider,
     providerModelId,
     stream ?? false,
     codexInstructions,
@@ -338,6 +341,8 @@ export type TBuildUpstreamRequestInput = {
   readonly upstreamWire: TUpstreamWire;
   /** The inbound body in the CLIENT's wire shape. */
   readonly rawBody: unknown;
+  /** Provider registry slug used to select final outbound policy. */
+  readonly provider: string;
   /** Concrete upstream model id to pin. */
   readonly providerModelId: string;
   /**
@@ -496,6 +501,7 @@ export const buildUpstreamRequest = (
       i.surface,
       i.upstreamWire,
       i.rawBody,
+      i.provider,
       i.providerModelId,
       i.stream,
       i.codexInstructions,
