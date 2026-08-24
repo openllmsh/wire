@@ -43,7 +43,8 @@ export const CONTEXT_SKIP_CONFIDENCE_FACTOR = 1;
  * tokenizer, so target every provider below its advertised window until the
  * vendor-grounded overflow path corrects from a real rejection.
  */
-export const TOKEN_ESTIMATE_FACTOR = 1.2;
+// 1.4 is the conservative maximum across providers; keep one shared constant.
+export const TOKEN_ESTIMATE_FACTOR = 1.4;
 
 /**
  * The compaction target for a hop: its input window shrunk by the shared
