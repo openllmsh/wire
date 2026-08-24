@@ -17,6 +17,12 @@
  * temperature / top_p / max_output_tokens accepted; response_format accepted
  * but runaway (deny); reasoning.context 400s (already omitted on grok path);
  * stop unprobed (deny). Codex 400s on max_output_tokens.
+ *
+ * Re-probe (2026-08-24, grok-4.5, full signed-307 daemon path): temperature and
+ * top_p re-confirmed accepted. `max_output_tokens` is accepted but NOT enforced
+ * (cap=16 returned 491 output tokens) — kept as harmless client-intent
+ * passthrough, do NOT rely on it as a hard output cap on grok. See
+ * docs/audit/2026-08-24-grok-responses-live-probe.md.
  */
 
 import type { TModelCaps } from "@openllmsh/protocol";
