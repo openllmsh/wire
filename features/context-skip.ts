@@ -43,8 +43,11 @@ export const CONTEXT_SKIP_CONFIDENCE_FACTOR = 1;
  * tokenizer, so target every provider below its advertised window until the
  * vendor-grounded overflow path corrects from a real rejection.
  */
-// 1.4 is the conservative maximum across providers; keep one shared constant.
-export const TOKEN_ESTIMATE_FACTOR = 1.4;
+// One shared constant across providers (collapsed from the old per-provider
+// table). 1.2 is a moderate calibration: it does not over-compact grok/openai
+// (higher values shrink the target and dull long contexts), and the
+// vendor-grounded overflow path corrects the rare Claude first-pass rejection.
+export const TOKEN_ESTIMATE_FACTOR = 1.2;
 
 /**
  * The compaction target for a hop: its input window shrunk by the shared
