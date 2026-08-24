@@ -264,6 +264,7 @@ export const buildUpstreamBody = (
       result as Record<string, unknown>,
       provider,
       caps,
+      upstreamWire,
     );
   }
   // Cross-wire: route through canonical, then encode to the upstream's wire.
@@ -278,6 +279,7 @@ export const buildUpstreamBody = (
     ),
     provider,
     caps,
+    upstreamWire,
   );
 };
 

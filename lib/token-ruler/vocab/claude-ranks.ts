@@ -5,8 +5,10 @@
  * https://github.com/coder/ai-tokenizer) by scripts/token-ruler/gen-claude-vocab.ts.
  *
  * The Claude tokenizer is not published by Anthropic; this table is a
- * reverse-engineered approximation. Counts are calibrated per-provider by
- * PROVIDER_TOKEN_ESTIMATE_FACTOR; the authoritative count is /v1/messages/count_tokens.
+ * reverse-engineered approximation. Counts use the shared
+ * `TOKEN_ESTIMATE_FACTOR` calibration defined in
+ * `packages/wire/features/context-skip.ts`; the authoritative count is
+ * /v1/messages/count_tokens.
  */
 // biome-ignore-all lint: vendored generated data
 // @ts-nocheck

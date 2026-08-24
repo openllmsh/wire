@@ -2,8 +2,8 @@
  * Claude vocab: the rank table (`./claude-ranks`) paired with its
  * pre-tokenisation regex and special tokens. The rank table is a
  * reverse-engineered approximation of Anthropic's (unpublished) tokenizer — see
- * `./claude-ranks` — so its counts are approximate and calibrated per-provider
- * by `PROVIDER_TOKEN_ESTIMATE_FACTOR`.
+ * `./claude-ranks` — so its counts are approximate and use the shared
+ * `TOKEN_ESTIMATE_FACTOR` calibration.
  *
  * The split pattern + special-token ranks come from ai-tokenizer's claude.json
  * (MIT, (c) 2025 Coder Technologies Inc.).

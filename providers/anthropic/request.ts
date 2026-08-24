@@ -481,6 +481,7 @@ export const toAnthropicRequest = (
     ...(system !== undefined ? { system } : {}),
     ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
     ...(req.top_p !== undefined ? { top_p: req.top_p } : {}),
+    ...(req.top_k !== undefined ? { top_k: req.top_k } : {}),
     ...(stop_sequences !== undefined ? { stop_sequences } : {}),
     ...(req.stream !== undefined ? { stream: req.stream } : {}),
     ...(tools !== undefined && tools.length > 0 ? { tools } : {}),

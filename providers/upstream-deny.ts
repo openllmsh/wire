@@ -19,8 +19,8 @@
  * stop unprobed (deny). Codex 400s on max_output_tokens.
  */
 
-import { applyModelCaps } from "../features/model-caps";
 import type { TModelCaps } from "@openllmsh/protocol";
+import { applyModelCaps } from "../features/model-caps";
 
 export type TParamWire = "anthropic" | "chatgpt" | "openai";
 
@@ -104,8 +104,21 @@ export const finalizeUpstreamBody = (
   body: Record<string, unknown>,
   provider: string,
   caps: TModelCaps | undefined,
-): Record<string, unknown> =>
-  applyModelCaps(applyProviderPolicy(body, PROVIDER_POLICY[provider]), caps);
+  wire?: TParamWire,
+): Record<string, unknown> => {
+  const policy = applyProviderPolicy(body, PROVIDER_POLICY[provider]);
+  if (wire === undefined) {
+    return applyModelCaps(policy, caps);
+  }
+
+  const denied = effectiveDeny(wire, PROVIDER_POLICY[provider]);
+  const deniedByWire: Record<string, unknown> = { ...policy };
+  for (const name of denied) {
+    delete deniedByWire[name];
+  }
+
+  return applyModelCaps(deniedByWire, caps);
+};
 
 export const effectiveDeny = (
   wire: TParamWire,
