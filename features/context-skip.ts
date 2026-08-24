@@ -38,54 +38,25 @@
 export const CONTEXT_SKIP_CONFIDENCE_FACTOR = 1;
 
 /**
- * Per-provider ruler→vendor-token calibration factor for last-resort compaction.
- * The local `estimateBodyTokens` ruler (o200k / claude encodings) counts FEWER
- * tokens than the vendor's own tokenizer for these providers, so a body
- * "compacted to fit window W" on our ruler can be W × factor real tokens and
- * still overflow upstream (making the retry fail too — and the one-shot latch
- * forbids a second attempt). Dividing the compaction target by the factor makes
- * the compacted body fit the VENDOR's tokenizer, not just ours.
- *
- * Seeded from live measurement (docs/audit/2026-07-23-compaction-live-test.md §4):
- *   - claude_code (Anthropic): vendor counted 299434 vs our 216246 → ×1.385
- *   - kimi_code (Kimi):        vendor counted 317227 vs our 283969 → ×1.117
- *   - chatgpt/openai (o200k):  o200k is OpenAI's own encoding → ~1.0
- * This is the static seed for the catalog-driven Layer-2 calibration the spike
- * recommended; it should eventually be derived from logged `tokens_in` instead.
+ * Conservative ruler→vendor-token calibration for last-resort compaction. The
+ * local `estimateBodyTokens` ruler can count fewer tokens than a vendor's own
+ * tokenizer, so target every provider below its advertised window until the
+ * vendor-grounded overflow path corrects from a real rejection.
  */
-export const PROVIDER_TOKEN_ESTIMATE_FACTOR: Readonly<Record<string, number>> =
-  {
-    anthropic: 1.4,
-    claude_code: 1.4,
-    kimi_code: 1.12,
-    // xAI Grok's tokenizer counts materially more than our o200k ruler. Left at
-    // 1, the daemon's compaction gate measured an oversized body on o200k, saw it
-    // "fit" the 500000 window, and SKIPPED compaction — so the request 400'd
-    // upstream (`maximum prompt length is 500000 ... contains 521105 tokens`).
-    // Conservative seed pending log-derived calibration (as kimi_code/claude_code
-    // were); the window is targeted exactly, so this must sit slightly above the
-    // true xAI/o200k ratio (this incident implies a lower bound of ~1.042).
-    grok: 1.15,
-    // OpenAI-family rulers are (near-)exact; no inflation.
-    openai: 1,
-    chatgpt: 1,
-  };
+export const TOKEN_ESTIMATE_FACTOR = 1.2;
 
 /**
- * The compaction target for a hop: its input window shrunk by the provider's
+ * The compaction target for a hop: its input window shrunk by the shared
  * calibration factor (so a body compacted to this size fits the vendor's real
  * tokenizer, not just our ruler) and by the shared context-gate safety factor.
- * Unknown providers use a calibration factor of 1 (no inflation — fail open).
  * Single source for BOTH seams (cloud dispatch chain + daemon walker) so the
  * target can't drift.
  */
 export const compactionTargetFor = (
-  provider: string,
+  _provider: string,
   window: number,
-): number => {
-  const factor = PROVIDER_TOKEN_ESTIMATE_FACTOR[provider] ?? 1;
-  return Math.floor((window / factor) * CONTEXT_SKIP_CONFIDENCE_FACTOR);
-};
+): number =>
+  Math.floor((window / TOKEN_ESTIMATE_FACTOR) * CONTEXT_SKIP_CONFIDENCE_FACTOR);
 
 /**
  * Single safety margin applied to the vendor-grounded compaction target: aim
