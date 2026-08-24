@@ -59,6 +59,39 @@ export const WIRE_DENY: TWireDeny = {
 
 export const PROVIDER_POLICY: Readonly<Record<string, TProviderParamPolicy>> = {
   grok: { allowParams: ["temperature", "top_p", "max_output_tokens"] },
+  kimi_code: {
+    aliases: {
+      max_completion_tokens: "max_tokens",
+    },
+    unsupportedParams: ["functions"],
+  },
+  google: {
+    unsupportedParams: ["top_k"],
+  },
+};
+
+export const applyProviderPolicy = (
+  body: Record<string, unknown>,
+  policy: TProviderParamPolicy | undefined,
+): Record<string, unknown> => {
+  const filtered = { ...body };
+  const aliases = policy?.aliases;
+  if (aliases !== undefined) {
+    for (const [from, to] of Object.entries(aliases)) {
+      if (Object.hasOwn(filtered, from) && !Object.hasOwn(filtered, to)) {
+        filtered[to] = filtered[from];
+        delete filtered[from];
+      }
+    }
+  }
+
+  for (const param of policy?.unsupportedParams ?? []) {
+    if (Object.hasOwn(filtered, param)) {
+      delete filtered[param];
+    }
+  }
+
+  return filtered;
 };
 
 export const effectiveDeny = (

@@ -14,6 +14,10 @@ import {
 } from "./anthropic/beta-headers";
 import { toAnthropicRequest } from "./anthropic/request";
 import { deriveChatGptSessionId, toChatGptRequest } from "./chatgpt/request";
+import {
+  applyProviderPolicy,
+  PROVIDER_POLICY,
+} from "./upstream-deny";
 
 /**
  * The SINGLE recipe for preparing an upstream provider request from an inbound
@@ -193,12 +197,17 @@ export const canonicalToUpstreamBody = (
     stream === true
       ? { ...openai.stream_options, include_usage: true }
       : openai.stream_options;
-  return {
-    ...openai,
-    ...(streamOptions !== undefined ? { stream_options: streamOptions } : {}),
-    model: providerModelId,
-    stream,
-  };
+  const openaiWithPolicy = applyProviderPolicy(
+    {
+      ...openai,
+      ...(streamOptions !== undefined ? { stream_options: streamOptions } : {}),
+      model: providerModelId,
+      stream,
+    },
+    PROVIDER_POLICY[providerModelId.split("/")[0]],
+  );
+
+  return openaiWithPolicy;
 };
 
 /** Inbound (client-shaped) body → an upstream body, per `(surface,
