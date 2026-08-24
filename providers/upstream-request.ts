@@ -3,6 +3,7 @@ import type {
   TChatCompletionRequest,
   TResponsesRequest,
 } from "@openllmsh/protocol";
+import type { TModelCaps } from "@openllmsh/protocol";
 import { fromAnthropicMessagesRequest } from "../adapters/messages/request";
 import { fromResponsesRequest } from "../adapters/responses";
 import { requestHasImageContent } from "../lib/canonical/content-part";
@@ -14,7 +15,7 @@ import {
 } from "./anthropic/beta-headers";
 import { toAnthropicRequest } from "./anthropic/request";
 import { deriveChatGptSessionId, toChatGptRequest } from "./chatgpt/request";
-import { applyProviderPolicy, PROVIDER_POLICY } from "./upstream-deny";
+import { finalizeUpstreamBody } from "./upstream-deny";
 
 /**
  * The SINGLE recipe for preparing an upstream provider request from an inbound
@@ -167,14 +168,15 @@ const hoistInlineAnthropicSystemMessages = (
 export const canonicalToUpstreamBody = (
   upstreamWire: TUpstreamWire,
   canonical: TChatCompletionRequest,
-  provider: string,
+  // Kept for callers of this public encoder; final policy runs in buildUpstreamBody.
+  _provider: string,
   providerModelId: string,
   stream: boolean,
   // Whether the chatgpt (Responses) encode injects the Codex preamble. Undefined
   // → inject (Codex default); `false` suppresses it for non-Codex Responses-wire
   // providers (xAI Grok). No effect for the anthropic / openai wires.
   codexInstructions?: boolean,
-): unknown => {
+): Record<string, unknown> => {
   if (upstreamWire === "chatgpt") {
     return toChatGptRequest(canonical, { providerModelId, codexInstructions });
   }
@@ -195,17 +197,12 @@ export const canonicalToUpstreamBody = (
     stream === true
       ? { ...openai.stream_options, include_usage: true }
       : openai.stream_options;
-  const openaiWithPolicy = applyProviderPolicy(
-    {
-      ...openai,
-      ...(streamOptions !== undefined ? { stream_options: streamOptions } : {}),
-      model: providerModelId,
-      stream,
-    },
-    PROVIDER_POLICY[provider],
-  );
-
-  return openaiWithPolicy;
+  return {
+    ...openai,
+    ...(streamOptions !== undefined ? { stream_options: streamOptions } : {}),
+    model: providerModelId,
+    stream,
+  };
 };
 
 /** Inbound (client-shaped) body → an upstream body, per `(surface,
@@ -223,7 +220,8 @@ export const buildUpstreamBody = (
   stream: boolean | undefined,
   // Codex-preamble injection for the chatgpt wire (see canonicalToUpstreamBody).
   codexInstructions?: boolean,
-): unknown => {
+  caps?: TModelCaps,
+): Record<string, unknown> => {
   // No gateway prompt prefix is injected anywhere. The gateway forwards the
   // client's system prompt verbatim on EVERY hop — a gateway-injected prefix
   // both breaks prompt-cache prefix stability (any variance collapses the
@@ -258,23 +256,28 @@ export const buildUpstreamBody = (
       ...(providerModelId.length > 0 ? { model: providerModelId } : {}),
       ...(stream !== undefined ? { stream } : {}),
     };
-    return upstreamWire === "anthropic"
-      ? normaliseAdaptiveThinking(hoistInlineAnthropicSystemMessages(pinned))
-      : upstreamWire === "openai"
-        ? applyProviderPolicy(
-            pinned,
-            PROVIDER_POLICY[provider],
-          )
+    const result =
+      upstreamWire === "anthropic"
+        ? normaliseAdaptiveThinking(hoistInlineAnthropicSystemMessages(pinned))
         : pinned;
+    return finalizeUpstreamBody(
+      result as Record<string, unknown>,
+      provider,
+      caps,
+    );
   }
   // Cross-wire: route through canonical, then encode to the upstream's wire.
-  return canonicalToUpstreamBody(
-    upstreamWire,
-    canonicalFromInbound(surface, rawBody),
+  return finalizeUpstreamBody(
+    canonicalToUpstreamBody(
+      upstreamWire,
+      canonicalFromInbound(surface, rawBody),
+      provider,
+      providerModelId,
+      stream ?? false,
+      codexInstructions,
+    ),
     provider,
-    providerModelId,
-    stream ?? false,
-    codexInstructions,
+    caps,
   );
 };
 
@@ -369,6 +372,8 @@ export type TBuildUpstreamRequestInput = {
    * (xAI Grok). See {@link canonicalToUpstreamBody}.
    */
   readonly codexInstructions?: boolean;
+  /** Catalog-declared final outbound-body constraints for the resolved hop. */
+  readonly caps?: TModelCaps;
   /**
    * Catalog capabilities for the resolved hop. Empty / missing = unknown
    * (custom / passthrough) — never treated as non-vision. The vision
@@ -505,6 +510,7 @@ export const buildUpstreamRequest = (
       i.providerModelId,
       i.stream,
       i.codexInstructions,
+      i.caps,
     ),
     headers: buildUpstreamHeaders(i),
   };
