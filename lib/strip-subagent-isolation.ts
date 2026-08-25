@@ -116,7 +116,13 @@ const targetToolCallsFrom = async (
   return toolCalls.flatMap((toolCall, index) => {
     if (!SUBAGENT_TOOL_NAMES.has(toolCall.function.name)) return [];
     const argumentsJson = stripIsolationArguments(toolCall.function.arguments);
-    const streamedIndex = orderedIndices[index] ?? index;
+    // No streamed choice-0 index for this accumulator position means the
+    // accumulator folded in a secondary choice (`n > 1`). Guessing an index
+    // could collide with a real choice-0 call and re-emit the wrong payload,
+    // so leave the tail byte-for-byte — the documented fallback for every
+    // other unhandled shape.
+    const streamedIndex = orderedIndices[index];
+    if (streamedIndex === undefined) return [];
     return argumentsJson === toolCall.function.arguments
       ? []
       : [{ index: streamedIndex, arguments: argumentsJson }];
