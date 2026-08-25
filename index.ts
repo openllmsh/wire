@@ -30,4 +30,5 @@ export * from "./lib/streaming/peek";
 export * from "./lib/streaming/sse";
 export * from "./lib/streaming/strip-tool-calls";
 export * from "./lib/streaming/upstream-error";
+export * from "./lib/strip-subagent-isolation";
 export * from "./lib/thinking-signature";
