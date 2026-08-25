@@ -1,9 +1,9 @@
 import type {
   TAnthropicRequest,
   TChatCompletionRequest,
+  TModelCaps,
   TResponsesRequest,
 } from "@openllmsh/protocol";
-import type { TModelCaps } from "@openllmsh/protocol";
 import { fromAnthropicMessagesRequest } from "../adapters/messages/request";
 import { fromResponsesRequest } from "../adapters/responses";
 import { requestHasImageContent } from "../lib/canonical/content-part";
@@ -222,14 +222,14 @@ export const buildUpstreamBody = (
   codexInstructions?: boolean,
   caps?: TModelCaps,
 ): Record<string, unknown> => {
-  // No gateway prompt prefix is injected anywhere. The gateway forwards the
-  // client's system prompt verbatim on EVERY hop — a gateway-injected prefix
-  // both breaks prompt-cache prefix stability (any variance collapses the
-  // shared prefix to a cache rebuild) and, on the subscription OAuth hop,
-  // self-identifies the request as a multi-provider gateway (the shape
-  // Anthropic's AUP "reverse engineering / duplicating model outputs"
-  // safeguard blocks). Steering prefixes now live ONLY at the CLI/client
-  // level (e.g. the `openllm claude` overlay), never in this chain.
+  // No gateway or CLI launch-overlay prompt prefix is injected anywhere. The
+  // gateway forwards the client's system prompt verbatim on EVERY hop — an
+  // injected prefix both breaks prompt-cache prefix stability (any variance
+  // collapses the shared prefix to a cache rebuild) and, on the subscription
+  // OAuth hop, self-identifies the request as a multi-provider gateway (the
+  // shape Anthropic's AUP "reverse engineering / duplicating model outputs"
+  // safeguard blocks). Caller-supplied system instructions are never changed
+  // in this chain.
   // Passthrough: same wire in + out (NEVER for `responses` — its body is
   // Responses-shaped). Only the model id + stream flag are pinned. The
   // Anthropic passthrough additionally normalises adaptive-thinking knobs
