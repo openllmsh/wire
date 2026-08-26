@@ -222,14 +222,7 @@ export const buildUpstreamBody = (
   codexInstructions?: boolean,
   caps?: TModelCaps,
 ): Record<string, unknown> => {
-  // No gateway or CLI launch-overlay prompt prefix is injected anywhere. The
-  // gateway forwards the client's system prompt verbatim on EVERY hop — an
-  // injected prefix both breaks prompt-cache prefix stability (any variance
-  // collapses the shared prefix to a cache rebuild) and, on the subscription
-  // OAuth hop, self-identifies the request as a multi-provider gateway (the
-  // shape Anthropic's AUP "reverse engineering / duplicating model outputs"
-  // safeguard blocks). Caller-supplied system instructions are never changed
-  // in this chain.
+  // No Claude launch-overlay prefix is injected.
   // Passthrough: same wire in + out (NEVER for `responses` — its body is
   // Responses-shaped). Only the model id + stream flag are pinned. The
   // Anthropic passthrough additionally normalises adaptive-thinking knobs
