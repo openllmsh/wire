@@ -1,6 +1,6 @@
+import type { TAnthropicWireOptions } from "./streaming";
 import type {
   TAnthropicContentBlock,
-  TAnthropicProviderOptions,
   TAnthropicResponse,
   TAnthropicStopReason,
   TAnthropicUsage,
@@ -83,6 +83,7 @@ const blocksToText = (
 
 const blocksToToolCalls = (
   blocks: ReadonlyArray<TAnthropicContentBlock>,
+  options: TAnthropicWireOptions,
 ): TToolCall[] => {
   const out: TToolCall[] = [];
   for (const block of blocks) {
@@ -91,7 +92,7 @@ const blocksToToolCalls = (
         id: block.id,
         type: "function",
         function: {
-          name: block.name,
+          name: options.toolNameMap?.get(block.name) ?? block.name,
           arguments: JSON.stringify(block.input ?? {}),
         },
       });
@@ -102,10 +103,10 @@ const blocksToToolCalls = (
 
 export const fromAnthropicResponse = (
   resp: TAnthropicResponse,
-  options: TAnthropicProviderOptions,
+  options: TAnthropicWireOptions,
 ): TChatCompletionResponse => {
   const text = blocksToText(resp.content);
-  const toolCalls = blocksToToolCalls(resp.content);
+  const toolCalls = blocksToToolCalls(resp.content, options);
   const created = Math.floor(Date.now() / 1000);
   return {
     id: resp.id,

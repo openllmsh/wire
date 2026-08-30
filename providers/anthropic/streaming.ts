@@ -39,6 +39,10 @@ const finishReasonFor = (
   }
 };
 
+export type TAnthropicWireOptions = TAnthropicProviderOptions & {
+  readonly toolNameMap?: ReadonlyMap<string, string>;
+};
+
 // runtime-only: mutable streaming state held across calls.
 export type TAnthropicStreamState = {
   id: string | null;
@@ -47,6 +51,7 @@ export type TAnthropicStreamState = {
   cacheCreationTokens: number;
   cacheReadTokens: number;
   created: number;
+  toolNameMap?: ReadonlyMap<string, string>;
   /** Map of Anthropic content-block index → OpenAI tool_calls index. */
   toolCallIndexFor: Map<number, number>;
   /** Next OpenAI tool_calls index to assign. */
@@ -54,7 +59,7 @@ export type TAnthropicStreamState = {
 };
 
 export const newAnthropicStreamState = (
-  options: TAnthropicProviderOptions,
+  options: TAnthropicWireOptions,
 ): TAnthropicStreamState => ({
   id: null,
   model: options.providerModelId,
@@ -62,6 +67,9 @@ export const newAnthropicStreamState = (
   cacheCreationTokens: 0,
   cacheReadTokens: 0,
   created: Math.floor(Date.now() / 1000),
+  ...(options.toolNameMap !== undefined && options.toolNameMap.size > 0
+    ? { toolNameMap: options.toolNameMap }
+    : {}),
   toolCallIndexFor: new Map(),
   nextToolCallIndex: 0,
 });
@@ -69,7 +77,7 @@ export const newAnthropicStreamState = (
 export const fromAnthropicStreamEvent = (
   event: TAnthropicStreamEvent,
   state: TAnthropicStreamState,
-  _options: TAnthropicProviderOptions,
+  _options: TAnthropicWireOptions,
 ): TChatCompletionChunk | null => {
   if (event.type === "message_start") {
     state.id = event.message.id;
@@ -111,7 +119,12 @@ export const fromAnthropicStreamEvent = (
                   index: toolCallIndex,
                   id: event.content_block.id,
                   type: "function",
-                  function: { name: event.content_block.name, arguments: "" },
+                  function: {
+                    name:
+                      state.toolNameMap?.get(event.content_block.name) ??
+                      event.content_block.name,
+                    arguments: "",
+                  },
                 },
               ],
             },
@@ -286,7 +299,7 @@ export const fromAnthropicStreamEvent = (
  */
 export const decodeAnthropicEventStream = (
   raw: ReadableStream<Uint8Array>,
-  providerModelId: string,
+  options: TAnthropicWireOptions,
 ): ReadableStream<TChatCompletionChunk> =>
   decodeProviderEventStream(
     raw,
@@ -295,5 +308,5 @@ export const decodeAnthropicEventStream = (
       initialState: newAnthropicStreamState,
       eventToChunk: fromAnthropicStreamEvent,
     },
-    { providerModelId },
+    options,
   );
