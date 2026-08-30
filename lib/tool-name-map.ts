@@ -64,11 +64,15 @@ const uniqueName = (
 ): string => {
   if (!used.has(base)) return base;
   const suffix = `_${stableHash(original)}`;
-  let candidate = `${Array.from(base).slice(0, maxLen - suffix.length).join("")}${suffix}`;
+  let candidate = `${Array.from(base)
+    .slice(0, maxLen - suffix.length)
+    .join("")}${suffix}`;
   // A hash collision is extremely unlikely, but retain deterministic uniqueness.
   for (let retry = 1; used.has(candidate); retry++) {
     const retrySuffix = `_${stableHash(`${original}:${retry}`)}`;
-    candidate = `${Array.from(base).slice(0, maxLen - retrySuffix.length).join("")}${retrySuffix}`;
+    candidate = `${Array.from(base)
+      .slice(0, maxLen - retrySuffix.length)
+      .join("")}${retrySuffix}`;
   }
   return candidate;
 };
@@ -83,11 +87,19 @@ export const buildToolNameMaps = (
 ): TToolNameMaps => {
   const seen = new Set<string>();
   for (const name of names) {
-    if (name.length === 0) throw new Error("Tool function name must not be empty");
-    if (seen.has(name)) throw new Error(`Duplicate tool function name: ${name}`);
+    if (name.length === 0)
+      throw new Error("Tool function name must not be empty");
+    if (seen.has(name))
+      throw new Error(`Duplicate tool function name: ${name}`);
     seen.add(name);
   }
-  if (names.every((name) => isAllowed(name, constraints.charset) && Array.from(name).length <= constraints.maxLen)) {
+  if (
+    names.every(
+      (name) =>
+        isAllowed(name, constraints.charset) &&
+        Array.from(name).length <= constraints.maxLen,
+    )
+  ) {
     return EMPTY_TOOL_NAME_MAPS;
   }
 
@@ -106,4 +118,51 @@ export const buildToolNameMaps = (
     if (assigned !== original) inbound.set(assigned, original);
   }
   return { outbound, inbound };
+};
+
+/**
+ * Request-scoped collision-safe map for tool-call IDs (original → unique upstream
+ * id). Unlike tool NAMES, an id legitimately REPEATS across an assistant
+ * `tool_call` and its matching `tool_result`, so duplicates are DEDUPED here (not
+ * rejected) and every DISTINCT original id is guaranteed a distinct sanitized id.
+ * Without this, two client ids differing only in disallowed characters (`call#1`
+ * vs `call@1`, or two >maxLen ids sharing a prefix) would collapse to one, and the
+ * upstream could not pair `tool_result` → `tool_use`. Both emission sites look the
+ * id up by its ORIGINAL value, so pairing is preserved. Forward-only: the upstream
+ * mints its own ids on the response, so no reverse map is needed. Returns an empty
+ * map when every distinct id already satisfies the constraints (no rewrite).
+ */
+export const buildToolCallIdMap = (
+  ids: ReadonlyArray<string>,
+  constraints: TToolNameConstraints,
+): ReadonlyMap<string, string> => {
+  const distinct: string[] = [];
+  const seen = new Set<string>();
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    distinct.push(id);
+  }
+  if (
+    distinct.every(
+      (id) =>
+        isAllowed(id, constraints.charset) &&
+        Array.from(id).length <= constraints.maxLen,
+    )
+  ) {
+    return EMPTY_TOOL_NAME_MAP;
+  }
+  const outbound = new Map<string, string>();
+  const used = new Set<string>();
+  for (const original of distinct) {
+    const assigned = uniqueName(
+      sanitizeToolIdentifier(original, constraints),
+      original,
+      used,
+      constraints.maxLen,
+    );
+    outbound.set(original, assigned);
+    used.add(assigned);
+  }
+  return outbound;
 };
