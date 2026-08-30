@@ -13,9 +13,24 @@ import {
   extractMessageText,
   parseToolArguments,
 } from "../../lib/canonical/message";
+import type { TToolNameMaps } from "../../lib/tool-name-map";
+import { buildToolCallIdMap, buildToolNameMaps } from "../../lib/tool-name-map";
 import { mapReasoningEffortToAnthropic } from "./adaptive-thinking";
 
 const DEFAULT_MAX_TOKENS = 4096;
+// Anthropic tool names and tool_use ids both use this documented identifier form.
+const ANTHROPIC_IDENTIFIER = {
+  charset: /^[a-zA-Z0-9_-]$/,
+  maxLen: 64,
+} as const;
+
+export const buildAnthropicToolNameMap = (
+  req: Pick<TChatCompletionRequest, "tools">,
+): ReadonlyMap<string, string> =>
+  buildToolNameMaps(
+    (req.tools ?? []).map((tool) => tool.function.name),
+    ANTHROPIC_IDENTIFIER,
+  ).inbound;
 
 /** Anthropic only has the one cache tier on the wire. */
 type TCacheControl = { readonly type: "ephemeral" };
@@ -265,15 +280,35 @@ const isTool = (
   m: TChatMessage,
 ): m is Extract<TChatMessage, { role: "tool" }> => m.role === "tool";
 
-const toolCallToUseBlock = (call: TToolCall): TAnthropicContentBlock => ({
+const outboundToolName = (name: string, maps: TToolNameMaps): string =>
+  maps.outbound.get(name) ?? name;
+
+// Resolve a client tool-call id to its request-scoped, collision-safe upstream
+// id. The map (built once per request) rewrites only when at least one id is
+// invalid, and then covers EVERY distinct id — so an id absent from the map is
+// already valid and must pass through VERBATIM. Re-sanitizing here would strip
+// leading/trailing/double underscores and collapse two distinct-but-valid ids
+// (e.g. `_x` and `x`) to one, breaking tool_use ↔ tool_result pairing.
+const anthropicToolCallId = (
+  id: string,
+  ids: ReadonlyMap<string, string>,
+): string => ids.get(id) ?? id;
+
+const toolCallToUseBlock = (
+  call: TToolCall,
+  names: TToolNameMaps,
+  ids: ReadonlyMap<string, string>,
+): TAnthropicContentBlock => ({
   type: "tool_use",
-  id: call.id,
-  name: call.function.name,
+  id: anthropicToolCallId(call.id, ids),
+  name: outboundToolName(call.function.name, names),
   input: parseToolArguments(call.function.arguments),
 });
 
 const assistantToBlocks = (
   m: Extract<TChatMessage, { role: "assistant" }>,
+  names: TToolNameMaps,
+  ids: ReadonlyMap<string, string>,
 ): TAnthropicContentBlock[] => {
   const blocks: TAnthropicContentBlock[] = [];
   // Assistant turns currently only carry text — vision/audio output is
@@ -282,18 +317,19 @@ const assistantToBlocks = (
   const text = extractMessageText(m.content);
   if (text.length > 0) blocks.push({ type: "text", text });
   for (const call of m.tool_calls ?? []) {
-    blocks.push(toolCallToUseBlock(call));
+    blocks.push(toolCallToUseBlock(call, names, ids));
   }
   return blocks;
 };
 
 const toolMessageToResultBlock = (
   m: Extract<TChatMessage, { role: "tool" }>,
+  ids: ReadonlyMap<string, string>,
 ): TAnthropicContentBlock =>
   withCacheControl(
     {
       type: "tool_result",
-      tool_use_id: m.tool_call_id,
+      tool_use_id: anthropicToolCallId(m.tool_call_id, ids),
       content: extractMessageText(m.content),
     },
     readCacheControl(m),
@@ -314,6 +350,8 @@ const toolMessageToResultBlock = (
  */
 const buildTurnMessages = (
   messages: ReadonlyArray<TChatMessage>,
+  names: TToolNameMaps,
+  ids: ReadonlyMap<string, string>,
 ): TAnthropicMessage[] => {
   const out: TAnthropicMessage[] = [];
   let pendingToolResults: TAnthropicContentBlock[] = [];
@@ -327,7 +365,7 @@ const buildTurnMessages = (
   for (const m of messages) {
     if (isSystem(m)) continue;
     if (isTool(m)) {
-      pendingToolResults.push(toolMessageToResultBlock(m));
+      pendingToolResults.push(toolMessageToResultBlock(m, ids));
       continue;
     }
     flushToolResults();
@@ -352,7 +390,7 @@ const buildTurnMessages = (
       continue;
     }
     if (isAssistant(m)) {
-      const blocks = assistantToBlocks(m);
+      const blocks = assistantToBlocks(m, names, ids);
       if (blocks.length === 0) continue;
       applyMessageCacheControl(blocks, readCacheControl(m));
       out.push({ role: "assistant", content: blocks });
@@ -364,10 +402,11 @@ const buildTurnMessages = (
 
 const toAnthropicTool = (
   tool: NonNullable<TChatCompletionRequest["tools"]>[number],
+  names: TToolNameMaps,
 ): TAnthropicTool => {
   const cc = readCacheControl(tool);
   return {
-    name: tool.function.name,
+    name: outboundToolName(tool.function.name, names),
     ...(tool.function.description !== undefined
       ? { description: tool.function.description }
       : {}),
@@ -381,11 +420,12 @@ const toAnthropicTool = (
 
 const toAnthropicToolChoice = (
   choice: NonNullable<TChatCompletionRequest["tool_choice"]>,
+  names: TToolNameMaps,
 ): TAnthropicRequest["tool_choice"] => {
   if (choice === "auto") return { type: "auto" };
   if (choice === "required") return { type: "any" };
   if (choice === "none") return { type: "none" };
-  return { type: "tool", name: choice.function.name };
+  return { type: "tool", name: outboundToolName(choice.function.name, names) };
 };
 
 type TSystemTextBlock = {
@@ -439,9 +479,29 @@ export const toAnthropicRequest = (
   req: TChatCompletionRequest,
   options: TAnthropicProviderOptions,
 ): TAnthropicRequest => {
+  const names = buildToolNameMaps(
+    (req.tools ?? []).map((tool) => tool.function.name),
+    ANTHROPIC_IDENTIFIER,
+  );
+  // Collision-safe id map covering every tool-call id in the request — both
+  // the assistant `tool_calls[].id` we replay AND the `tool_call_id` on tool
+  // results, so a rewritten id still pairs with its result. Distinct originals
+  // stay distinct (unlike a per-id sanitize, which could collapse two).
+  const toolCallIds: string[] = [];
+  for (const m of req.messages) {
+    if (m.role === "assistant") {
+      for (const call of m.tool_calls ?? []) toolCallIds.push(call.id);
+    } else if (m.role === "tool") {
+      toolCallIds.push(m.tool_call_id);
+    }
+  }
+  const idMap = buildToolCallIdMap(toolCallIds, {
+    ...ANTHROPIC_IDENTIFIER,
+    fallback: "tool_call",
+  });
   const system = buildSystem(req.messages);
 
-  const turnMessages = buildTurnMessages(req.messages);
+  const turnMessages = buildTurnMessages(req.messages, names, idMap);
 
   const max_tokens =
     req.max_completion_tokens ??
@@ -456,10 +516,10 @@ export const toAnthropicRequest = (
         ? req.stop
         : undefined;
 
-  const tools = req.tools?.map(toAnthropicTool);
+  const tools = req.tools?.map((tool) => toAnthropicTool(tool, names));
   const toolChoice =
     req.tool_choice !== undefined
-      ? toAnthropicToolChoice(req.tool_choice)
+      ? toAnthropicToolChoice(req.tool_choice, names)
       : undefined;
 
   // `reasoning_effort` → Anthropic extended thinking. Single source of

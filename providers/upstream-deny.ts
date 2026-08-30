@@ -142,6 +142,56 @@ export const effectiveDeny = (
 };
 
 /**
+ * Canonical request fields whose loss is observable to Chat Completions clients.
+ * `WIRE_DENY` covers explicit policy denial; this map covers intentional builder
+ * omissions recorded in the chat-completions parameter-fate audit.
+ */
+const SIGNAL_FIELDS = [
+  "response_format",
+  "seed",
+  "presence_penalty",
+  "frequency_penalty",
+  "logit_bias",
+  "n",
+  "metadata",
+  "stream_options",
+  "top_k",
+  "parallel_tool_calls",
+] as const;
+
+const WIRE_BUILDER_OMISSIONS: Readonly<
+  Record<TParamWire, ReadonlySet<string>>
+> = {
+  anthropic: new Set([
+    "response_format",
+    "metadata",
+    "stream_options",
+    "parallel_tool_calls",
+  ]),
+  chatgpt: new Set(["stream_options"]),
+  openai: new Set(),
+};
+
+/**
+ * Return signal fields the client supplied that this resolved upstream wire will
+ * not carry. Renamed fields deliberately stay out: those are translations, not
+ * drops. The result preserves `SIGNAL_FIELDS` order for a stable response header.
+ */
+export const droppedSignalParams = (
+  request: Record<string, unknown>,
+  wire: TParamWire,
+  provider: string,
+): ReadonlyArray<string> => {
+  const denied = effectiveDeny(wire, PROVIDER_POLICY[provider]);
+  const omitted = WIRE_BUILDER_OMISSIONS[wire];
+  return SIGNAL_FIELDS.filter(
+    (field): boolean =>
+      Object.hasOwn(request, field) &&
+      (denied.has(field) || omitted.has(field)),
+  );
+};
+
+/**
  * Non-Codex Responses-wire hops (today: Grok) share `toChatGptRequest` and
  * signal via `codexInstructions: false`. Map that flag to the grok overlay
  * without an `if (provider === "grok")` branch.

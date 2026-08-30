@@ -327,6 +327,7 @@ export const withStreamDeadline = (
   const reader = source.getReader();
   let lastId = "chatcmpl-openllm-deadline";
   let lastModel = "";
+  let lastCreated = 0;
   let finished = false;
   const DEADLINE: unique symbol = Symbol("deadline");
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -342,10 +343,15 @@ export const withStreamDeadline = (
       timer = null;
     }
   };
+  // The synthetic terminal preserves the stream's last-seen id/created/model but
+  // carries NO usage: OpenAI reports usage once, last-wins, on a `choices: []`
+  // chunk, so re-emitting the last usage snapshot on this populated-choice
+  // terminal would double-count for clients that sum snapshots. The usage-logging
+  // tee accounts partial usage independently.
   const terminal = (): TChatCompletionChunk => ({
     id: lastId,
     object: "chat.completion.chunk",
-    created: Math.floor(Date.now() / 1000),
+    created: lastCreated !== 0 ? lastCreated : Math.floor(Date.now() / 1000),
     model: lastModel,
     choices: [{ index: 0, delta: {}, finish_reason: "length" }],
   });
@@ -398,6 +404,9 @@ export const withStreamDeadline = (
       }
       if (typeof value.model === "string" && value.model.length > 0) {
         lastModel = value.model;
+      }
+      if (typeof value.created === "number" && value.created > 0) {
+        lastCreated = value.created;
       }
       controller.enqueue(value);
     },

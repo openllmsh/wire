@@ -6,6 +6,7 @@ import type {
 } from "@openllmsh/protocol";
 
 import { plainTextFromReasoningItems } from "../../adapters/messages/reasoning-from-items";
+import { normalizeToolCallFinishReason } from "./finish-reason";
 import { IncompleteStreamError } from "./upstream-error";
 
 const ZERO_USAGE: TChatCompletionResponse["usage"] = {
@@ -45,6 +46,9 @@ export const accumulateChunksToResponse = async (
   let sawUsage = false;
   let id = "";
   let created = Math.floor(Date.now() / 1000);
+  let systemFingerprint: string | undefined;
+  let refusal = "";
+  let logprobsContent: unknown[] | undefined;
   const toolCalls = new Map<number, TToolCallBuilder>();
   let reasoningContent = "";
   let reasoningItems: ReadonlyArray<unknown> | undefined;
@@ -58,6 +62,12 @@ export const accumulateChunksToResponse = async (
       if (done) break;
       if (value.id !== "") id = value.id;
       if (value.created !== 0) created = value.created;
+      if (
+        typeof value.system_fingerprint === "string" &&
+        value.system_fingerprint.length > 0
+      ) {
+        systemFingerprint = value.system_fingerprint;
+      }
       const choice = value.choices[0];
       if (choice === undefined) {
         if (value.usage !== undefined && value.usage !== null) {
@@ -73,6 +83,7 @@ export const accumulateChunksToResponse = async (
       const delta = choice.delta;
       if (delta !== undefined) {
         if (typeof delta.content === "string") content += delta.content;
+        if (typeof delta.refusal === "string") refusal += delta.refusal;
         if (typeof delta.reasoning_content === "string") {
           reasoningContent += delta.reasoning_content;
         }
@@ -103,6 +114,15 @@ export const accumulateChunksToResponse = async (
             toolCalls.set(tc.index, next);
           }
         }
+      }
+      if (
+        choice.logprobs !== null &&
+        typeof choice.logprobs === "object" &&
+        "content" in choice.logprobs &&
+        Array.isArray(choice.logprobs.content)
+      ) {
+        logprobsContent ??= [];
+        logprobsContent.push(...choice.logprobs.content);
       }
       if (choice.finish_reason !== null && choice.finish_reason !== undefined) {
         finishReason = choice.finish_reason;
@@ -148,16 +168,14 @@ export const accumulateChunksToResponse = async (
     });
   }
 
-  // If the upstream forgot to set `finish_reason: "tool_calls"` while
-  // emitting tool_call deltas (observed on chatgpt.com `/codex/responses`
-  // for `gpt-5.x-codex`), force it. Without this, the messages adapter
-  // maps `stop` → `end_turn`, which tells Claude Code the turn is over
-  // and the tool_use block goes unused.
-  const effectiveFinishReason: TChatCompletionResponse["choices"][number]["finish_reason"] =
-    finalToolCalls.length > 0 &&
-    (finishReason === null || finishReason === "stop")
-      ? "tool_calls"
-      : (finishReason ?? "stop");
+  const effectiveFinishReason =
+    normalizeToolCallFinishReason({
+      message:
+        finalToolCalls.length > 0
+          ? { tool_calls: finalToolCalls }
+          : undefined,
+      finish_reason: finishReason,
+    }) ?? "stop";
 
   const reasoningFromItems = plainTextFromReasoningItems(reasoningItems);
   /** OpenLLM: surface ref `Delta.reasoning_items` text as `reasoning_content` when deltas omitted. */
@@ -169,12 +187,16 @@ export const accumulateChunksToResponse = async (
     object: "chat.completion",
     created,
     model: providerModelId,
+    ...(systemFingerprint !== undefined
+      ? { system_fingerprint: systemFingerprint }
+      : {}),
     choices: [
       {
         index: 0,
         message: {
           role: "assistant",
           content,
+          ...(refusal.length > 0 ? { refusal } : {}),
           ...(finalToolCalls.length > 0 ? { tool_calls: finalToolCalls } : {}),
           ...(effectiveReasoningContent.length > 0
             ? { reasoning_content: effectiveReasoningContent }
@@ -187,6 +209,9 @@ export const accumulateChunksToResponse = async (
             : {}),
         },
         finish_reason: effectiveFinishReason,
+        ...(logprobsContent !== undefined
+          ? { logprobs: { content: logprobsContent } }
+          : {}),
       },
     ],
     usage,
