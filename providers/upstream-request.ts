@@ -14,6 +14,7 @@ import {
   deriveAnthropicBetaHeader,
 } from "./anthropic/beta-headers";
 import { toAnthropicRequest } from "./anthropic/request";
+import { normaliseAnthropicNativeTools } from "./anthropic/web-search-domains";
 import { deriveChatGptSessionId, toChatGptRequest } from "./chatgpt/request";
 import { finalizeUpstreamBody } from "./upstream-deny";
 
@@ -251,7 +252,11 @@ export const buildUpstreamBody = (
     };
     const result =
       upstreamWire === "anthropic"
-        ? normaliseAdaptiveThinking(hoistInlineAnthropicSystemMessages(pinned))
+        ? normaliseAdaptiveThinking(
+            hoistInlineAnthropicSystemMessages(
+              normaliseAnthropicNativeTools(pinned),
+            ),
+          )
         : pinned;
     return finalizeUpstreamBody(
       result as Record<string, unknown>,

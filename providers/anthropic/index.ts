@@ -7,3 +7,4 @@ export * from "./beta-headers";
 export * from "./request";
 export * from "./response";
 export * from "./streaming";
+export * from "./web-search-domains";
