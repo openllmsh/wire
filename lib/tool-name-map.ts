@@ -78,23 +78,29 @@ const uniqueName = (
 };
 
 /**
- * Create request-scoped paired maps. Empty and duplicate declarations are adapter
- * errors; a non-empty map is returned only when an identifier is lossy.
+ * Create request-scoped paired maps (original client name → unique upstream name).
+ * A non-empty map is returned only when an identifier is actually lossy, so a set
+ * of already-valid names yields an empty map and a byte-identical request.
+ *
+ * Duplicate and empty declarations are the client's problem, NOT ours: we do NOT
+ * throw (an uncaught throw in the hop would 500 rather than let the upstream return
+ * a clean 400, and it would diverge from the chatgpt path, which dedups). Duplicates
+ * reuse the first assignment; an empty name falls back through
+ * `sanitizeToolIdentifier`. Distinct originals are always kept distinct.
  */
 export const buildToolNameMaps = (
   names: ReadonlyArray<string>,
   constraints: TToolNameConstraints,
 ): TToolNameMaps => {
+  const distinct: string[] = [];
   const seen = new Set<string>();
   for (const name of names) {
-    if (name.length === 0)
-      throw new Error("Tool function name must not be empty");
-    if (seen.has(name))
-      throw new Error(`Duplicate tool function name: ${name}`);
+    if (seen.has(name)) continue;
     seen.add(name);
+    distinct.push(name);
   }
   if (
-    names.every(
+    distinct.every(
       (name) =>
         isAllowed(name, constraints.charset) &&
         Array.from(name).length <= constraints.maxLen,
@@ -106,7 +112,7 @@ export const buildToolNameMaps = (
   const outbound = new Map<string, string>();
   const inbound = new Map<string, string>();
   const used = new Set<string>();
-  for (const original of names) {
+  for (const original of distinct) {
     const assigned = uniqueName(
       sanitizeToolIdentifier(original, constraints),
       original,

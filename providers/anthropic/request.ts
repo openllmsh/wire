@@ -14,11 +14,7 @@ import {
   parseToolArguments,
 } from "../../lib/canonical/message";
 import type { TToolNameMaps } from "../../lib/tool-name-map";
-import {
-  buildToolCallIdMap,
-  buildToolNameMaps,
-  sanitizeToolIdentifier,
-} from "../../lib/tool-name-map";
+import { buildToolCallIdMap, buildToolNameMaps } from "../../lib/tool-name-map";
 import { mapReasoningEffortToAnthropic } from "./adaptive-thinking";
 
 const DEFAULT_MAX_TOKENS = 4096;
@@ -288,17 +284,15 @@ const outboundToolName = (name: string, maps: TToolNameMaps): string =>
   maps.outbound.get(name) ?? name;
 
 // Resolve a client tool-call id to its request-scoped, collision-safe upstream
-// id. The map (built once per request) guarantees distinct originals stay
-// distinct; the bare sanitize is only a fallback for an id the map didn't cover.
+// id. The map (built once per request) rewrites only when at least one id is
+// invalid, and then covers EVERY distinct id — so an id absent from the map is
+// already valid and must pass through VERBATIM. Re-sanitizing here would strip
+// leading/trailing/double underscores and collapse two distinct-but-valid ids
+// (e.g. `_x` and `x`) to one, breaking tool_use ↔ tool_result pairing.
 const anthropicToolCallId = (
   id: string,
   ids: ReadonlyMap<string, string>,
-): string =>
-  ids.get(id) ??
-  sanitizeToolIdentifier(id, {
-    ...ANTHROPIC_IDENTIFIER,
-    fallback: "tool_call",
-  });
+): string => ids.get(id) ?? id;
 
 const toolCallToUseBlock = (
   call: TToolCall,
