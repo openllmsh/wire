@@ -6,6 +6,7 @@ import type {
   TUsage,
 } from "@openllmsh/protocol";
 import { AnthropicStreamEvent } from "@openllmsh/protocol";
+import { normalizeToolCallFinishReason } from "../../lib/streaming/finish-reason";
 import { decodeProviderEventStream } from "../../lib/streaming/provider-decode";
 import { UpstreamStreamError } from "../../lib/streaming/upstream-error";
 
@@ -260,7 +261,12 @@ export const fromAnthropicStreamEvent = (
         {
           index: 0,
           delta: {},
-          finish_reason: finish,
+          finish_reason: normalizeToolCallFinishReason({
+            finish_reason: finish,
+            ...(state.toolCallIndexFor.size > 0
+              ? { delta: { tool_calls: [] } }
+              : {}),
+          }),
         },
       ],
       usage,

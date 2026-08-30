@@ -43,6 +43,10 @@ export type TChatGptStreamOptions = TChatGptProviderOptions & {
 };
 
 export type TChatGptStreamState = {
+  /** Stable Chat Completions id for the whole stream. Minted once. */
+  id: string;
+  /** Unix seconds, minted once — OpenAI keeps `created` stable across chunks. */
+  created: number;
   hasToolCall: boolean;
   reasoningItems: Map<string, TReasoningItem>;
   emittedReasoningIds: Set<string>;
@@ -79,6 +83,8 @@ export type TChatGptStreamState = {
 export const newChatGptStreamState = (
   options: TChatGptStreamOptions,
 ): TChatGptStreamState => ({
+  id: `chatcmpl-${crypto.randomUUID()}`,
+  created: Math.floor(Date.now() / 1000),
   hasToolCall: false,
   reasoningItems: new Map(),
   emittedReasoningIds: new Set(),
@@ -111,7 +117,7 @@ const finalizeToolArgs = (
   state.argsFinalizedIndexes.add(outputIndex);
   state.hasToolCall = true;
   return {
-    ...baseChunk(options),
+    ...baseChunk(state, options),
     choices: [
       {
         index: 0,
@@ -162,11 +168,12 @@ const drainUnemittedReasoning = (
 };
 
 const baseChunk = (
+  state: TChatGptStreamState,
   options: TChatGptStreamOptions,
 ): Pick<TChatCompletionChunk, "id" | "object" | "created" | "model"> => ({
-  id: `chatcmpl-${crypto.randomUUID()}`,
+  id: state.id,
   object: "chat.completion.chunk",
-  created: Math.floor(Date.now() / 1000),
+  created: state.created,
   model: options.providerModelId,
 });
 
@@ -477,7 +484,7 @@ const terminalChunk = (
   }
 
   return {
-    ...baseChunk(options),
+    ...baseChunk(state, options),
     choices: [
       {
         index: 0,
@@ -519,7 +526,7 @@ export const chatGptEventToChunk = (
 
   if (type === "response.created") {
     return {
-      ...baseChunk(options),
+      ...baseChunk(state, options),
       choices: [
         {
           index: 0,
@@ -534,7 +541,7 @@ export const chatGptEventToChunk = (
     const delta = stringField(event, "delta");
     if (delta === undefined) return null;
     return {
-      ...baseChunk(options),
+      ...baseChunk(state, options),
       choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
     };
   }
@@ -549,7 +556,7 @@ export const chatGptEventToChunk = (
         : stringField(event, "delta");
     if (delta === undefined || delta.length === 0) return null;
     return {
-      ...baseChunk(options),
+      ...baseChunk(state, options),
       choices: [
         {
           index: 0,
@@ -580,7 +587,7 @@ export const chatGptEventToChunk = (
       if (search !== null) {
         if (search.kind === "immediate") {
           return {
-            ...baseChunk(options),
+            ...baseChunk(state, options),
             choices: [
               {
                 index: 0,
@@ -596,7 +603,7 @@ export const chatGptEventToChunk = (
           // lifecycle entries; terminal emission prevents one count per URL.
           if (search.results.length > 0) {
             return {
-              ...baseChunk(options),
+              ...baseChunk(state, options),
               choices: [
                 {
                   index: 0,
@@ -657,7 +664,7 @@ export const chatGptEventToChunk = (
         : null;
     if (drained.length > 0 || toolChunk !== null) {
       return {
-        ...baseChunk(options),
+        ...baseChunk(state, options),
         choices: [
           {
             index: 0,
@@ -702,7 +709,7 @@ export const chatGptEventToChunk = (
         : undefined;
     const outputIndex = numberField(event, "output_index") ?? 0;
     return {
-      ...baseChunk(options),
+      ...baseChunk(state, options),
       choices: [
         {
           index: 0,
@@ -734,7 +741,7 @@ export const chatGptEventToChunk = (
     const outputIndex = numberField(event, "output_index") ?? 0;
     state.argsStreamedIndexes.add(outputIndex);
     return {
-      ...baseChunk(options),
+      ...baseChunk(state, options),
       choices: [
         {
           index: 0,
