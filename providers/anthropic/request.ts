@@ -24,13 +24,41 @@ const ANTHROPIC_IDENTIFIER = {
   maxLen: 64,
 } as const;
 
+/**
+ * Collect every client-facing tool name that may cross the Anthropic boundary.
+ *
+ * Definitions lead so collision assignments for declared tools remain stable;
+ * replayed assistant calls and an explicit function choice then fill in names
+ * that exist only in history or selection state.
+ */
+export const collectAnthropicToolNames = (
+  req: Pick<TChatCompletionRequest, "tools" | "messages" | "tool_choice">,
+): ReadonlyArray<string> => {
+  const names: string[] = [];
+  const seen = new Set<string>();
+  const add = (name: string): void => {
+    if (!seen.has(name)) {
+      seen.add(name);
+      names.push(name);
+    }
+  };
+
+  for (const tool of req.tools ?? []) add(tool.function.name);
+  for (const message of req.messages) {
+    if (message.role !== "assistant") continue;
+    for (const call of message.tool_calls ?? []) add(call.function.name);
+  }
+  if (req.tool_choice !== undefined && typeof req.tool_choice !== "string") {
+    add(req.tool_choice.function.name);
+  }
+  return names;
+};
+
 export const buildAnthropicToolNameMap = (
-  req: Pick<TChatCompletionRequest, "tools">,
+  req: Pick<TChatCompletionRequest, "tools" | "messages" | "tool_choice">,
 ): ReadonlyMap<string, string> =>
-  buildToolNameMaps(
-    (req.tools ?? []).map((tool) => tool.function.name),
-    ANTHROPIC_IDENTIFIER,
-  ).inbound;
+  buildToolNameMaps(collectAnthropicToolNames(req), ANTHROPIC_IDENTIFIER)
+    .inbound;
 
 /** Anthropic only has the one cache tier on the wire. */
 type TCacheControl = { readonly type: "ephemeral" };
@@ -480,7 +508,7 @@ export const toAnthropicRequest = (
   options: TAnthropicProviderOptions,
 ): TAnthropicRequest => {
   const names = buildToolNameMaps(
-    (req.tools ?? []).map((tool) => tool.function.name),
+    collectAnthropicToolNames(req),
     ANTHROPIC_IDENTIFIER,
   );
   // Collision-safe id map covering every tool-call id in the request — both

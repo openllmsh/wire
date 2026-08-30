@@ -276,9 +276,7 @@ export const fromAnthropicStreamEvent = (
           delta: {},
           finish_reason: normalizeToolCallFinishReason({
             finish_reason: finish,
-            ...(state.toolCallIndexFor.size > 0
-              ? { delta: { tool_calls: [] } }
-              : {}),
+            hasToolCalls: state.toolCallIndexFor.size > 0,
           }),
         },
       ],

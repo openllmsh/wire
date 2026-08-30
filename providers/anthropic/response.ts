@@ -1,4 +1,3 @@
-import type { TAnthropicWireOptions } from "./streaming";
 import type {
   TAnthropicContentBlock,
   TAnthropicResponse,
@@ -8,6 +7,7 @@ import type {
   TToolCall,
   TUsage,
 } from "@openllmsh/protocol";
+import type { TAnthropicWireOptions } from "./streaming";
 
 const finishReasonFor = (
   stop: TAnthropicStopReason | null,

@@ -45,7 +45,8 @@ export const accumulateChunksToResponse = async (
   let usage: TChatCompletionResponse["usage"] = ZERO_USAGE;
   let sawUsage = false;
   let id = "";
-  let created = Math.floor(Date.now() / 1000);
+  let created = 0;
+  let hasCreated = false;
   let systemFingerprint: string | undefined;
   let refusal = "";
   let logprobsContent: unknown[] | undefined;
@@ -61,7 +62,10 @@ export const accumulateChunksToResponse = async (
       const { value, done } = await reader.read();
       if (done) break;
       if (value.id !== "") id = value.id;
-      if (value.created !== 0) created = value.created;
+      if (Number.isFinite(value.created) && value.created >= 0) {
+        created = value.created;
+        hasCreated = true;
+      }
       if (
         typeof value.system_fingerprint === "string" &&
         value.system_fingerprint.length > 0
@@ -171,9 +175,7 @@ export const accumulateChunksToResponse = async (
   const effectiveFinishReason =
     normalizeToolCallFinishReason({
       message:
-        finalToolCalls.length > 0
-          ? { tool_calls: finalToolCalls }
-          : undefined,
+        finalToolCalls.length > 0 ? { tool_calls: finalToolCalls } : undefined,
       finish_reason: finishReason,
     }) ?? "stop";
 
@@ -185,7 +187,7 @@ export const accumulateChunksToResponse = async (
   return {
     id: id !== "" ? id : `chatcmpl-${crypto.randomUUID()}`,
     object: "chat.completion",
-    created,
+    created: hasCreated ? created : Math.floor(Date.now() / 1000),
     model: providerModelId,
     ...(systemFingerprint !== undefined
       ? { system_fingerprint: systemFingerprint }

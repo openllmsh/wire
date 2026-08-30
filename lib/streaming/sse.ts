@@ -328,6 +328,7 @@ export const withStreamDeadline = (
   let lastId = "chatcmpl-openllm-deadline";
   let lastModel = "";
   let lastCreated = 0;
+  let hasCreated = false;
   let finished = false;
   const DEADLINE: unique symbol = Symbol("deadline");
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -351,7 +352,7 @@ export const withStreamDeadline = (
   const terminal = (): TChatCompletionChunk => ({
     id: lastId,
     object: "chat.completion.chunk",
-    created: lastCreated !== 0 ? lastCreated : Math.floor(Date.now() / 1000),
+    created: hasCreated ? lastCreated : Math.floor(Date.now() / 1000),
     model: lastModel,
     choices: [{ index: 0, delta: {}, finish_reason: "length" }],
   });
@@ -405,8 +406,9 @@ export const withStreamDeadline = (
       if (typeof value.model === "string" && value.model.length > 0) {
         lastModel = value.model;
       }
-      if (typeof value.created === "number" && value.created > 0) {
+      if (Number.isFinite(value.created) && value.created >= 0) {
         lastCreated = value.created;
+        hasCreated = true;
       }
       controller.enqueue(value);
     },

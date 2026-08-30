@@ -168,7 +168,7 @@ const WIRE_BUILDER_OMISSIONS: Readonly<
     "stream_options",
     "parallel_tool_calls",
   ]),
-  chatgpt: new Set(["stream_options"]),
+  chatgpt: new Set(["stream_options", "n", "logit_bias"]),
   openai: new Set(),
 };
 

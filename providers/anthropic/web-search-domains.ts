@@ -1,4 +1,4 @@
-const ANTHROPIC_WEB_SEARCH_TOOL_TYPE = "web_search_20250305";
+const ANTHROPIC_WEB_SEARCH_TOOL_TYPE = /^web_search_\d{8}$/;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -18,7 +18,8 @@ export const normaliseAnthropicNativeTools = (
   const tools = body.tools.map((tool) => {
     if (
       !isRecord(tool) ||
-      tool.type !== ANTHROPIC_WEB_SEARCH_TOOL_TYPE ||
+      typeof tool.type !== "string" ||
+      !ANTHROPIC_WEB_SEARCH_TOOL_TYPE.test(tool.type) ||
       ((!Array.isArray(tool.blocked_domains) ||
         tool.blocked_domains.length > 0) &&
         (!Array.isArray(tool.allowed_domains) ||
