@@ -166,6 +166,23 @@ const hoistInlineAnthropicSystemMessages = (
   };
 };
 
+/**
+ * Remove opaque Responses-only carriers before sending a canonical request to
+ * an OpenAI-compatible upstream. Responses/Codex re-emits these fields, but
+ * ordinary OpenAI-compatible APIs reject all three as unknown arguments.
+ */
+export const stripResponsesCarriers = (
+  request: TChatCompletionRequest,
+): TChatCompletionRequest => {
+  const {
+    responses_tools: _responsesTools,
+    responses_additional_tools: _responsesAdditionalTools,
+    responses_client_metadata: _responsesClientMetadata,
+    ...withoutCarriers
+  } = request;
+  return withoutCarriers;
+};
+
 export const canonicalToUpstreamBody = (
   upstreamWire: TUpstreamWire,
   canonical: TChatCompletionRequest,
@@ -185,15 +202,10 @@ export const canonicalToUpstreamBody = (
   if (upstreamWire === "anthropic") {
     return { ...toAnthropicRequest(canonical, options), stream };
   }
-  // openai-identity passthrough: forward canonical verbatim, but DROP the
-  // Responses-only opaque carriers — chatgpt re-emits them; openai-compatible
-  // upstreams 400 on unknown keys.
-  const {
-    responses_tools: _responsesTools,
-    responses_additional_tools: _responsesAdditionalTools,
-    responses_client_metadata: _responsesClientMetadata,
-    ...openai
-  } = canonical;
+  // OpenAI-identity passthrough drops `responses_tools`,
+  // `responses_additional_tools`, and `responses_client_metadata`: ChatGPT
+  // re-emits them, while OpenAI-compatible upstreams reject all three.
+  const openai = stripResponsesCarriers(canonical);
   const streamOptions =
     stream === true
       ? { ...openai.stream_options, include_usage: true }
