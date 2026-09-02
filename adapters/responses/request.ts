@@ -28,9 +28,11 @@ import type { TCanonicalContentPart } from "../../lib/canonical/content-part";
  *  - `reasoning.effort` → `reasoning_effort`; `max_output_tokens` → `max_tokens`.
  */
 
+// Message items are the only input items carrying `content` with a `role`
+// (their `type` is optional), so select them by `role` rather than `type`.
 type TResponsesContentPart = Extract<
   TResponsesInputItem,
-  { type: "message" }
+  { role: "user" | "assistant" | "system" | "developer"; content: unknown }
 >["content"];
 
 /** Responses content (string | parts) → canonical content (string | parts). */

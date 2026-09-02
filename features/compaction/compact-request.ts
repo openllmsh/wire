@@ -567,13 +567,17 @@ const dropOldestTurns = (
   return survivors;
 };
 
+/** Responses `message` items may omit `type` (OpenAI treats it as optional). */
+const isResponsesMessageItem = (item: Record<string, unknown>): boolean =>
+  item.type === "message" || item.type === undefined;
+
 /** The index of the last Responses `message` item with `role:"user"`. */
 const lastResponsesUserIndex = (input: ReadonlyArray<unknown>): number =>
   input.reduceRight<number>(
     (acc, item, idx) =>
       acc === -1 &&
       isRecord(item) &&
-      item.type === "message" &&
+      isResponsesMessageItem(item) &&
       item.role === "user"
         ? idx
         : acc,
@@ -602,7 +606,7 @@ const dropOldestResponsesItems = (
     if (
       isRecord(item) &&
       (item.type === "additional_tools" ||
-        (item.type === "message" &&
+        (isResponsesMessageItem(item) &&
           (item.role === "system" || item.role === "developer")))
     ) {
       start++;
@@ -618,7 +622,7 @@ const dropOldestResponsesItems = (
     const item = survivors[i];
     if (
       isRecord(item) &&
-      item.type === "message" &&
+      isResponsesMessageItem(item) &&
       (item.role === "system" || item.role === "developer")
     ) {
       i++;
