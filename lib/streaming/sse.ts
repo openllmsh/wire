@@ -7,7 +7,6 @@ import type {
 const SSE_DONE = "[DONE]";
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
 
 export const encodeSseEvent = (data: unknown): Uint8Array => {
   const payload = data === SSE_DONE ? SSE_DONE : JSON.stringify(data);
@@ -29,54 +28,147 @@ export const encodeSseComment = (comment: string): Uint8Array =>
 export const encodeAnthropicPing = (): Uint8Array =>
   textEncoder.encode('event: ping\ndata: {"type": "ping"}\n\n');
 
-const splitLines = (buffer: string): { events: string[]; rest: string } => {
-  const events: string[] = [];
-  let rest = buffer;
-  for (;;) {
-    const i = rest.indexOf("\n\n");
-    if (i === -1) return { events, rest };
-    events.push(rest.slice(0, i));
-    rest = rest.slice(i + 2);
+/**
+ * Length of an SSE line terminator at `i`, or 0 if this is not one.
+ * Returns -1 when `buffer[i]` is CR at end-of-buffer: a following LF
+ * (the second half of CRLF) may still arrive, so the caller must wait.
+ */
+const lineTerminatorLength = (
+  buffer: string,
+  i: number,
+  holdSplitCrlf: boolean,
+): number => {
+  if (i >= buffer.length) return 0;
+  if (buffer[i] === "\r") {
+    if (i + 1 >= buffer.length) return holdSplitCrlf ? -1 : 1;
+    return buffer[i + 1] === "\n" ? 2 : 1;
   }
+  if (buffer[i] === "\n") return 1;
+  return 0;
+};
+
+const stripTrailingLineTerminator = (value: string): string => {
+  if (value.endsWith("\r\n")) return value.slice(0, -2);
+  if (value.endsWith("\n") || value.endsWith("\r")) return value.slice(0, -1);
+  return value;
+};
+
+/**
+ * Split a buffer into complete SSE events (blank-line terminated) and
+ * leftover bytes. Accepts LF, CRLF, CR, and mixed endings. A CR at the
+ * end of the buffer is never treated as a terminator on its own so a
+ * CRLF pair split across chunks stays one terminator.
+ */
+type TSplitFrame = {
+  readonly content: string;
+  readonly raw: string;
+};
+
+const splitFrames = (
+  buffer: string,
+): { frames: TSplitFrame[]; rest: string } => {
+  const frames: TSplitFrame[] = [];
+  let i = 0;
+  let lineStart = 0;
+  let eventStart = 0;
+  while (i < buffer.length) {
+    const term = lineTerminatorLength(buffer, i, true);
+    if (term === -1) break;
+    if (term === 0) {
+      i += 1;
+      continue;
+    }
+    if (i === lineStart) {
+      frames.push({
+        content: stripTrailingLineTerminator(
+          buffer.slice(eventStart, lineStart),
+        ),
+        raw: buffer.slice(eventStart, i + term),
+      });
+      i += term;
+      eventStart = i;
+      lineStart = i;
+      continue;
+    }
+    i += term;
+    lineStart = i;
+  }
+  return { frames, rest: buffer.slice(eventStart) };
+};
+
+const sseFieldLines = (raw: string): string[] => {
+  const lines: string[] = [];
+  let i = 0;
+  let lineStart = 0;
+  while (i < raw.length) {
+    const term = lineTerminatorLength(raw, i, false);
+    if (term === -1) break;
+    if (term === 0) {
+      i += 1;
+      continue;
+    }
+    lines.push(raw.slice(lineStart, i));
+    i += term;
+    lineStart = i;
+  }
+  if (lineStart < raw.length) {
+    lines.push(raw.slice(lineStart));
+  }
+  return lines;
 };
 
 const parseEvent = (raw: string): TSseEvent | null => {
-  const trimmed = raw.replace(/\r/g, "");
-  if (trimmed === "") return null;
-  if (trimmed.startsWith(":"))
-    return { kind: "comment", comment: trimmed.slice(1).trimStart() };
-  const lines = trimmed.split("\n");
+  const lines = sseFieldLines(raw);
   const dataLines: string[] = [];
+  let comment: string | null = null;
   for (const line of lines) {
-    if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+    if (line === "") continue;
+    if (line.startsWith(":")) {
+      if (comment === null) comment = line.slice(1).trimStart();
+      continue;
+    }
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+    // event: / id: / retry: are ignored and must not erase data.
   }
-  if (dataLines.length === 0) return null;
-  const data = dataLines.join("\n");
-  if (data === SSE_DONE) return { kind: "done" };
-  return { kind: "data", data };
+  if (dataLines.length > 0) {
+    const data = dataLines.join("\n");
+    if (data === SSE_DONE) return { kind: "done" };
+    return { kind: "data", data };
+  }
+  if (comment !== null) return { kind: "comment", comment };
+  return null;
 };
 
 export const sseEventStream = (
   source: ReadableStream<Uint8Array>,
 ): ReadableStream<TSseEvent> => {
   const reader = source.getReader();
+  const decoder = new TextDecoder();
   let buffer = "";
   return new ReadableStream<TSseEvent>({
     async pull(controller) {
       for (;;) {
         const { value, done } = await reader.read();
         if (done) {
-          const trailing = parseEvent(buffer);
+          buffer += decoder.decode();
+          const { frames, rest } = splitFrames(buffer);
+          for (const frame of frames) {
+            const parsed = parseEvent(frame.content);
+            if (parsed) controller.enqueue(parsed);
+          }
+          const trailing = parseEvent(rest);
           if (trailing) controller.enqueue(trailing);
           controller.close();
           return;
         }
-        buffer += textDecoder.decode(value, { stream: true });
-        const { events, rest } = splitLines(buffer);
+        buffer += decoder.decode(value, { stream: true });
+        const { frames, rest } = splitFrames(buffer);
         buffer = rest;
-        if (events.length === 0) continue;
-        for (const e of events) {
-          const parsed = parseEvent(e);
+        if (frames.length === 0) continue;
+        for (const frame of frames) {
+          const parsed = parseEvent(frame.content);
           if (parsed) controller.enqueue(parsed);
         }
         return;
@@ -202,6 +294,7 @@ export const withFrameAlignedHeartbeat = (
   options: THeartbeatOptions,
 ): ReadableStream<Uint8Array> => {
   const reader = source.getReader();
+  const decoder = new TextDecoder();
   let timer: ReturnType<typeof setInterval> | null = null;
   let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
   let closed = false;
@@ -241,23 +334,28 @@ export const withFrameAlignedHeartbeat = (
         for (;;) {
           const { value, done } = await reader.read();
           if (done) {
-            // Flush any unterminated trailing bytes verbatim so an
-            // upstream that ends mid-frame loses nothing.
-            if (buffer.length > 0) {
-              controller.enqueue(textEncoder.encode(buffer));
-              buffer = "";
+            // Flush decoder state, then any unterminated trailing bytes
+            // verbatim so an upstream that ends mid-frame loses nothing.
+            buffer += decoder.decode();
+            const flushed = splitFrames(buffer);
+            for (const frame of flushed.frames) {
+              controller.enqueue(textEncoder.encode(frame.raw));
             }
+            if (flushed.rest.length > 0) {
+              controller.enqueue(textEncoder.encode(flushed.rest));
+            }
+            buffer = "";
             closed = true;
             clear();
             controller.close();
             return;
           }
-          buffer += textDecoder.decode(value, { stream: true });
-          const { events, rest } = splitLines(buffer);
+          buffer += decoder.decode(value, { stream: true });
+          const { frames, rest } = splitFrames(buffer);
           buffer = rest;
-          if (events.length === 0) continue;
-          for (const e of events) {
-            controller.enqueue(textEncoder.encode(`${e}\n\n`));
+          if (frames.length === 0) continue;
+          for (const frame of frames) {
+            controller.enqueue(textEncoder.encode(frame.raw));
           }
           return;
         }
