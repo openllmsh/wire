@@ -64,6 +64,12 @@ export type TChatGptStreamState = {
   argsStreamedIndexes: Set<number>;
   /** `output_index`es whose authoritative `.done` args were emitted. */
   argsFinalizedIndexes: Set<number>;
+  /** `output_index`es whose tool-call `id` already went out on a delta. */
+  toolIdEmittedIndexes: Set<number>;
+  /** `output_index`es whose tool-call `name` already went out on a delta. */
+  toolNameEmittedIndexes: Set<number>;
+  /** Tool `call_id`/`id` values already emitted, so terminal `output[]` cannot re-open them at a different index. */
+  emittedToolCallIds: Set<string>;
   /**
    * `web_search_call` entries are lifecycle split (`search` + `open_page`) and
    * must be coalesced by id so one logical source-search counts as one request.
@@ -90,6 +96,9 @@ export const newChatGptStreamState = (
   emittedReasoningIds: new Set(),
   argsStreamedIndexes: new Set(),
   argsFinalizedIndexes: new Set(),
+  toolIdEmittedIndexes: new Set(),
+  toolNameEmittedIndexes: new Set(),
+  emittedToolCallIds: new Set(),
   serverSearchById: new Map(),
   ...(options.toolNameMap !== undefined && options.toolNameMap.size > 0
     ? { toolNameMap: options.toolNameMap }
@@ -361,6 +370,51 @@ const toolCallId = (item: Record<string, unknown>): string | undefined =>
 const toolCallName = (item: Record<string, unknown>): string | undefined =>
   isApplyPatchItem(item) ? "apply_patch" : stringField(item, "name");
 
+type TToolCallDelta = NonNullable<
+  NonNullable<
+    TChatCompletionChunk["choices"][number]["delta"]["tool_calls"]
+  >[number]
+>;
+
+/** Id/name that have not yet been emitted for this `output_index`. Marks them emitted. */
+const takeUnemittedToolIdentity = (
+  state: TChatGptStreamState,
+  outputIndex: number,
+  item: Record<string, unknown>,
+): { id?: string; name?: string } => {
+  const callId = toolCallId(item);
+  const emittedName = toolCallName(item);
+  const name =
+    emittedName !== undefined
+      ? (state.toolNameMap?.get(emittedName) ?? emittedName)
+      : undefined;
+  const out: { id?: string; name?: string } = {};
+  if (callId !== undefined && !state.toolIdEmittedIndexes.has(outputIndex)) {
+    state.toolIdEmittedIndexes.add(outputIndex);
+    state.emittedToolCallIds.add(callId);
+    out.id = callId;
+  }
+  if (name !== undefined && !state.toolNameEmittedIndexes.has(outputIndex)) {
+    state.toolNameEmittedIndexes.add(outputIndex);
+    out.name = name;
+  }
+  return out;
+};
+
+const toolCallDelta = (
+  outputIndex: number,
+  identity: { id?: string; name?: string },
+  args: string,
+): TToolCallDelta => ({
+  index: outputIndex,
+  ...(identity.id !== undefined ? { id: identity.id } : {}),
+  type: "function",
+  function: {
+    ...(identity.name !== undefined ? { name: identity.name } : {}),
+    arguments: args,
+  },
+});
+
 /**
  * A `custom_tool_call`'s arguments ride the JSON `input`, not `arguments`.
  * Coerce to a JSON-**object** string so the canonical tool call carries valid
@@ -483,6 +537,42 @@ const terminalChunk = (
     };
   }
 
+  const terminalToolCalls: TToolCallDelta[] = [];
+  if (Array.isArray(terminalOutput)) {
+    terminalOutput.forEach((raw, outputIndex) => {
+      if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+        return;
+      }
+      const item = raw as Record<string, unknown>;
+      if (isServerSearchItem(item) || !isToolCallItem(item)) return;
+      const existingId = toolCallId(item);
+      if (
+        existingId !== undefined &&
+        state.emittedToolCallIds.has(existingId)
+      ) {
+        return;
+      }
+      const identity = takeUnemittedToolIdentity(state, outputIndex, item);
+      const alreadyArgs =
+        state.argsStreamedIndexes.has(outputIndex) ||
+        state.argsFinalizedIndexes.has(outputIndex);
+      const args = alreadyArgs ? "" : toolCallArguments(item);
+      if (
+        identity.id === undefined &&
+        identity.name === undefined &&
+        args.length === 0
+      ) {
+        return;
+      }
+      if (args.length > 0) {
+        state.argsFinalizedIndexes.add(outputIndex);
+      }
+      state.hasToolCall = true;
+      hasToolCall = true;
+      terminalToolCalls.push(toolCallDelta(outputIndex, identity, args));
+    });
+  }
+
   return {
     ...baseChunk(state, options),
     choices: [
@@ -494,6 +584,9 @@ const terminalChunk = (
             : {}),
           ...(serverSearchCalls.length > 0
             ? { server_search_calls: serverSearchCalls }
+            : {}),
+          ...(terminalToolCalls.length > 0
+            ? { tool_calls: terminalToolCalls }
             : {}),
         },
         finish_reason: truncated
@@ -653,16 +746,34 @@ export const chatGptEventToChunk = (
     // summaries with tool calls) previously early-returned the reasoning and
     // DROPPED the tool args, so the sub-agent (`Task`/`Agent`) never spawned.
     // Both ride ONE chunk (a delta may carry reasoning_items + tool_calls).
-    const toolChunk =
-      item !== undefined && isToolCallItem(item) && !isApplyPatchItem(item)
-        ? finalizeToolArgs(
+    const outputIndex = numberField(event, "output_index") ?? 0;
+    let toolCalls: TToolCallDelta[] | undefined;
+    if (
+      item !== undefined &&
+      isToolCallItem(item) &&
+      !isServerSearchItem(item)
+    ) {
+      const identity = takeUnemittedToolIdentity(state, outputIndex, item);
+      const argsChunk = isApplyPatchItem(item)
+        ? null
+        : finalizeToolArgs(
             state,
-            numberField(event, "output_index") ?? 0,
+            outputIndex,
             toolCallArguments(item),
             options,
-          )
-        : null;
-    if (drained.length > 0 || toolChunk !== null) {
+          );
+      const args =
+        argsChunk?.choices[0]?.delta.tool_calls?.[0]?.function?.arguments ?? "";
+      if (
+        identity.id !== undefined ||
+        identity.name !== undefined ||
+        args.length > 0
+      ) {
+        state.hasToolCall = true;
+        toolCalls = [toolCallDelta(outputIndex, identity, args)];
+      }
+    }
+    if (drained.length > 0 || toolCalls !== undefined) {
       return {
         ...baseChunk(state, options),
         choices: [
@@ -670,9 +781,7 @@ export const chatGptEventToChunk = (
             index: 0,
             delta: {
               ...(drained.length > 0 ? { reasoning_items: drained } : {}),
-              ...(toolChunk !== null
-                ? { tool_calls: toolChunk.choices[0]?.delta.tool_calls }
-                : {}),
+              ...(toolCalls !== undefined ? { tool_calls: toolCalls } : {}),
             },
             finish_reason: null,
           },
@@ -684,12 +793,47 @@ export const chatGptEventToChunk = (
 
   if (type === "response.function_call_arguments.done") {
     const outputIndex = numberField(event, "output_index") ?? 0;
-    return finalizeToolArgs(
+    const nestedItem = objectField(event, "item");
+    const identityItem: Record<string, unknown> = {
+      ...(nestedItem ?? {}),
+      ...(stringField(event, "call_id") !== undefined
+        ? { call_id: stringField(event, "call_id") }
+        : {}),
+      ...(stringField(event, "name") !== undefined
+        ? { name: stringField(event, "name") }
+        : {}),
+    };
+    const identity = takeUnemittedToolIdentity(
       state,
       outputIndex,
-      stringField(event, "arguments") ?? "",
-      options,
+      identityItem,
     );
+    const doneArgs =
+      stringField(event, "arguments") ??
+      (nestedItem !== undefined ? toolCallArguments(nestedItem) : "");
+    const argsChunk = finalizeToolArgs(state, outputIndex, doneArgs, options);
+    const args =
+      argsChunk?.choices[0]?.delta.tool_calls?.[0]?.function?.arguments ?? "";
+    if (
+      identity.id === undefined &&
+      identity.name === undefined &&
+      argsChunk === null
+    ) {
+      return null;
+    }
+    state.hasToolCall = true;
+    return {
+      ...baseChunk(state, options),
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [toolCallDelta(outputIndex, identity, args)],
+          },
+          finish_reason: null,
+        },
+      ],
+    };
   }
 
   if (type === "response.output_item.added") {
@@ -701,32 +845,19 @@ export const chatGptEventToChunk = (
     captureReasoningItem(state, item);
     if (!isToolCallItem(item)) return null;
     state.hasToolCall = true;
-    const callId = toolCallId(item);
-    const emittedName = toolCallName(item);
-    const name =
-      emittedName !== undefined
-        ? (state.toolNameMap?.get(emittedName) ?? emittedName)
-        : undefined;
     const outputIndex = numberField(event, "output_index") ?? 0;
+    const identity = takeUnemittedToolIdentity(state, outputIndex, item);
+    const args = isApplyPatchItem(item) ? toolCallArguments(item) : "";
+    if (args.length > 0) {
+      state.argsFinalizedIndexes.add(outputIndex);
+    }
     return {
       ...baseChunk(state, options),
       choices: [
         {
           index: 0,
           delta: {
-            tool_calls: [
-              {
-                index: outputIndex,
-                ...(callId !== undefined ? { id: callId } : {}),
-                type: "function",
-                function: {
-                  ...(name !== undefined ? { name } : {}),
-                  arguments: isApplyPatchItem(item)
-                    ? toolCallArguments(item)
-                    : "",
-                },
-              },
-            ],
+            tool_calls: [toolCallDelta(outputIndex, identity, args)],
           },
           finish_reason: null,
         },
@@ -765,24 +896,40 @@ export const chatGptEventToChunk = (
     response !== undefined
       ? objectField(response, "incomplete_details")
       : undefined;
+  const isCompletedAlias =
+    type === "response.completed" || type === "response.done";
+  const incompleteReason =
+    incomplete !== undefined ? stringField(incomplete, "reason") : undefined;
+  const responseStatus =
+    response !== undefined ? stringField(response, "status") : undefined;
+  const responseError =
+    response !== undefined ? objectField(response, "error") : undefined;
   // Hitting the configured output limit is a well-formed partial turn, not an
   // upstream failure. Clients can resume it only when they receive an honest
   // `finish_reason: "length"` terminal chunk.
-  if (
-    type === "response.incomplete" &&
-    stringField(incomplete ?? {}, "reason") === "max_output_tokens"
-  ) {
-    return terminalChunk(response, state, options, true);
+  if (incompleteReason === "max_output_tokens") {
+    if (type === "response.incomplete" || isCompletedAlias) {
+      return terminalChunk(response, state, options, true);
+    }
   }
 
   // `response.failed`, error, and incomplete reasons other than the configured
   // output limit mean the upstream gave up mid-stream. Throw so the runner
   // converts them into an SSE error frame for streaming clients and a 502
-  // envelope for non-streaming clients.
+  // envelope for non-streaming clients. `response.done` is an alias of
+  // `response.completed`; a failed/incomplete-shaped payload on either must
+  // NOT become a success terminal.
+  const aliasIsFailure =
+    isCompletedAlias &&
+    (responseStatus === "failed" ||
+      responseError !== undefined ||
+      (incompleteReason !== undefined &&
+        incompleteReason !== "max_output_tokens"));
   if (
     type === "response.failed" ||
     type === "response.incomplete" ||
-    type === "error"
+    type === "error" ||
+    aliasIsFailure
   ) {
     const errorObj =
       objectField(event, "error") ??
@@ -819,11 +966,31 @@ export const chatGptEventToChunk = (
     throw new UpstreamStreamError(code, `${code}: ${message}`);
   }
 
-  if (type === "response.completed") {
+  if (isCompletedAlias) {
     return terminalChunk(response, state, options, false);
   }
 
   // response.in_progress / response.content_part.* / response.created
   // tail / etc — ignore.
   return null;
+};
+
+/**
+ * Semantic-end predicate for Responses SSE. Convert the event first; the
+ * shared decode driver closes the canonical stream and cancels the source
+ * when this returns true so Messages/Astra do not wait for transport EOF.
+ * Failed / non-max-token incomplete events still throw from
+ * `chatGptEventToChunk` and take the error path.
+ */
+export const isChatGptResponsesTerminalEvent = (
+  event: TChatGptStreamEvent,
+): boolean => {
+  const type = event.type;
+  return (
+    type === "response.completed" ||
+    type === "response.done" ||
+    type === "response.incomplete" ||
+    type === "response.failed" ||
+    type === "error"
+  );
 };
