@@ -6,9 +6,10 @@
  * those to the client's wire.
  *
  * `core`'s version takes a whole `TChatProviderSpec`; this takes just the
- * three streaming pieces (`eventSchema` + `initialState` + `eventToChunk`)
- * so it has no dependency on `core`'s spec machinery — only `effect`'s
- * `Schema` (for decode) + `@openllmsh/protocol` + the wire SSE primitives.
+ * streaming pieces (`eventSchema` + `initialState` + `eventToChunk` +
+ * optional `isTerminalEvent`) so it has no dependency on `core`'s spec
+ * machinery — only `effect`'s `Schema` (for decode) + `@openllmsh/protocol`
+ * + the wire SSE primitives.
  */
 import type { TChatCompletionChunk } from "@openllmsh/protocol";
 import { Schema } from "effect";
@@ -23,6 +24,14 @@ export type TStreamDecodeSpec<TEvent, TState, TOpts> = {
     state: TState,
     options: TOpts,
   ) => TChatCompletionChunk | null;
+  /**
+   * Optional semantic-end predicate. When it returns true for a decoded
+   * event, the driver converts the event, closes the canonical stream,
+   * then cancels the source without awaiting transport EOF. Providers
+   * without this keep reading until EOF so usage trailers can still
+   * arrive (generic OpenAI-compat).
+   */
+  readonly isTerminalEvent?: (event: TEvent) => boolean;
 };
 
 /**
@@ -30,6 +39,20 @@ export type TStreamDecodeSpec<TEvent, TState, TOpts> = {
  * `core`'s `providerEventStream` exactly, including the DashScope
  * `choices: []` recovery (harmless for non-OpenAI event schemas — it only
  * runs on the already-failed decode path).
+ *
+ * Alibaba DashScope (and other OpenAI-compatible upstreams) OMIT the
+ * `choices` key entirely on the trailing `stream_options.include_usage`
+ * chunk — spec-correct providers send `choices: []`. The OpenAI chunk
+ * schema makes `choices` required, so that chunk fails decode. Since it
+ * is the ONLY chunk carrying token counts, a silent drop means zero
+ * usage for Alibaba (no live feed, no final total) while spec-correct
+ * providers work. Retry once with an empty `choices` filled in. (For
+ * non-OpenAI event schemas the extra key is ignored on decode, so this
+ * is provider-safe and only ever runs on the already-failed path.)
+ *
+ * A genuinely undecodable frame is still dropped so one odd chunk can't
+ * kill the stream — but surface it under a debug flag so the next
+ * provider divergence isn't invisible.
  */
 export const decodeProviderEventStream = <TEvent, TState, TOpts>(
   raw: ReadableStream<Uint8Array>,
@@ -40,58 +63,110 @@ export const decodeProviderEventStream = <TEvent, TState, TOpts>(
   const events = sseEventStream(raw);
   const decode = Schema.decodeUnknownSync(spec.eventSchema);
   const reader = events.getReader();
+  let settled = false;
+
+  const initiateCancel = (reason?: unknown): void => {
+    void reader.cancel(reason).catch(() => {});
+  };
+
+  const settleClose = (
+    controller: ReadableStreamDefaultController<TChatCompletionChunk>,
+  ): void => {
+    if (settled) return;
+    settled = true;
+    controller.close();
+    initiateCancel("semantic-terminal");
+  };
+
+  const settleError = (
+    controller: ReadableStreamDefaultController<TChatCompletionChunk>,
+    err: unknown,
+  ): void => {
+    if (settled) return;
+    settled = true;
+    controller.error(err);
+    initiateCancel(err);
+  };
+
   return new ReadableStream<TChatCompletionChunk>({
     async pull(controller) {
+      if (settled) {
+        controller.close();
+        return;
+      }
       for (;;) {
-        const { value, done } = await reader.read();
-        if (done) {
-          controller.close();
-          return;
-        }
-        if (value.kind !== "data") continue;
-        let parsedJson: unknown;
         try {
-          parsedJson = JSON.parse(value.data);
-        } catch {
-          continue;
-        }
-        let event: TEvent;
-        try {
-          event = decode(parsedJson);
-        } catch (firstErr) {
-          let recovered: TEvent | null = null;
-          if (
-            parsedJson !== null &&
-            typeof parsedJson === "object" &&
-            !("choices" in parsedJson)
-          ) {
-            try {
-              recovered = decode({ ...parsedJson, choices: [] });
-            } catch {
-              recovered = null;
-            }
+          const read = await reader.read();
+          if (settled) return;
+          if (read.done) {
+            settled = true;
+            controller.close();
+            return;
           }
-          if (recovered === null) {
-            if (process.env.OPENLLM_DEBUG_STREAM === "1") {
-              console.warn(
-                "[decodeProviderEventStream] dropped undecodable SSE chunk:",
-                firstErr instanceof Error ? firstErr.message : String(firstErr),
-                value.data.slice(0, 600),
-              );
-            }
+          const value = read.value;
+          if (value.kind !== "data") continue;
+          let parsedJson: unknown;
+          try {
+            parsedJson = JSON.parse(value.data);
+          } catch {
             continue;
           }
-          event = recovered;
-        }
-        const chunk = spec.eventToChunk(event, state, options);
-        if (chunk !== null) {
-          controller.enqueue(chunk);
+          let event: TEvent;
+          try {
+            event = decode(parsedJson);
+          } catch (firstErr) {
+            let recovered: TEvent | null = null;
+            if (
+              parsedJson !== null &&
+              typeof parsedJson === "object" &&
+              !("choices" in parsedJson)
+            ) {
+              try {
+                recovered = decode({ ...parsedJson, choices: [] });
+              } catch {
+                recovered = null;
+              }
+            }
+            if (recovered === null) {
+              if (process.env.OPENLLM_DEBUG_STREAM === "1") {
+                console.warn(
+                  "[decodeProviderEventStream] dropped undecodable SSE chunk:",
+                  firstErr instanceof Error
+                    ? firstErr.message
+                    : String(firstErr),
+                  value.data.slice(0, 600),
+                );
+              }
+              continue;
+            }
+            event = recovered;
+          }
+          let chunk: TChatCompletionChunk | null = null;
+          try {
+            chunk = spec.eventToChunk(event, state, options);
+          } catch (err) {
+            settleError(controller, err);
+            return;
+          }
+          const terminal = spec.isTerminalEvent?.(event) === true;
+          if (chunk !== null && !settled) {
+            controller.enqueue(chunk);
+          }
+          if (terminal) {
+            settleClose(controller);
+            return;
+          }
+          if (chunk !== null) return;
+        } catch (err) {
+          if (settled) return;
+          settleError(controller, err);
           return;
         }
       }
     },
     cancel(reason) {
-      reader.cancel(reason).catch(() => {});
+      settled = true;
+      initiateCancel(reason);
     },
   });
 };
