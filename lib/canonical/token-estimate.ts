@@ -11,7 +11,8 @@
  *   - {@link estimateAnthropicInputTokens} — the CLIENT-FACING preflight
  *     (`/v1/messages/count_tokens`). Counts only what the model actually reads,
  *     so a client's context-window indicator isn't inflated by transport noise.
- *     Never use the routing estimator here: base64 image data alone would make
+ *     Always uses a real BPE (default {@link DEFAULT_ENCODING} / o200k). Never
+ *     use the routing estimator here: base64 image data alone would make
  *     Claude Code believe a fresh session was nearly full.
  */
 
@@ -30,8 +31,12 @@
  * an extra chain step than ship an oversized request that 400s.
  */
 
-import type { TTokenEncoding } from "./encoding-select";
-import { DEFAULT_ENCODING, peekTokenCounter } from "./encoding-select";
+import type { TTokenCounter, TTokenEncoding } from "./encoding-select";
+import {
+  DEFAULT_ENCODING,
+  getTokenCounter,
+  peekTokenCounter,
+} from "./encoding-select";
 
 /**
  * Count a single string as tokens for `encoding`, using the real BPE ruler when
@@ -127,10 +132,6 @@ export const estimateBodyTokensExact = (
   return rulerTokens(parts.join("\n"), encoding);
 };
 
-// The real BPE ruler when warm, `chars/4` when cold — see {@link rulerTokens}.
-const textTokens = (text: string, encoding: TTokenEncoding): number =>
-  rulerTokens(text, encoding);
-
 /**
  * The text an Anthropic content value actually puts in front of the model:
  * `text` blocks, a `tool_use`'s serialized input, a `tool_result`'s body
@@ -162,36 +163,9 @@ const anthropicContentText = (content: unknown): string => {
   return parts.join("\n");
 };
 
-/**
- * Estimated `input_tokens` for an Anthropic-shaped Messages body — the answer
- * `/v1/messages/count_tokens` serves ONLY as a fallback, when the vendor's own
- * endpoint isn't reachable (no Anthropic-wire hop at the head of the chain, no
- * local credential, or an upstream refusal). Whenever the vendor can be asked,
- * its exact count is relayed instead and this function is not consulted.
- *
- * Single-sourced here because BOTH preflight paths need the same number: the
- * cloud handler (`@openllm/api/handlers/count-tokens`) and the daemon's local
- * surface (`runCountTokens` in the walker). They used to carry separate copies.
- *
- * KNOWN LIMIT — text only. Images and documents contribute nothing, so an
- * image-heavy (or image-only) request UNDER-counts, materially. This is
- * deliberate: Anthropic prices an image at roughly `(w × h) / 750` tokens, and
- * neither dimension is recoverable from a base64 blob or a URL without decoding
- * or fetching it — so any number we put there would be fabricated, and a
- * fabricated count is worse than a knowingly-low one for a fallback whose
- * consumers use it as a context-window indicator. Counting the blob's own length
- * (what {@link estimateBodyTokens} does) is not a substitute: it tracks encoding
- * size, not token cost, and overstates by orders of magnitude.
- */
-export const estimateAnthropicInputTokens = (body: unknown): number => {
-  if (body === null || typeof body !== "object") return 0;
-  // This body is Anthropic-shaped by definition, so the Claude ruler is the
-  // right one when it's warm; cold, we fall back to `chars/4`.
-  const enc: TTokenEncoding = "claude";
+const visibleTranscriptOf = (body: unknown): string => {
+  if (body === null || typeof body !== "object") return "";
   const b = body as Record<string, unknown>;
-
-  // Gather the model-visible text once. Sections stay SEPARATE because the cold
-  // heuristic rounds per section (and that rounding is a pinned contract).
   const sections: string[] = [];
   const system = b.system;
   if (typeof system === "string") sections.push(system);
@@ -204,20 +178,47 @@ export const estimateAnthropicInputTokens = (body: unknown): number => {
       );
     }
   }
-  // Tool schemas are billed as input too, and they are not small.
   if (Array.isArray(b.tools) && b.tools.length > 0) {
     sections.push(JSON.stringify(b.tools));
   }
+  return sections.filter((s) => s.length > 0).join("\n");
+};
 
-  const counter = peekTokenCounter(enc);
-  if (counter === null) {
-    let total = 0;
-    for (const s of sections) total += textTokens(s, enc);
-    return total;
-  }
-  // Warm — ONE BPE pass over the whole transcript rather than one per message
-  // (a 40-message body used to mean 42 separate tokenizer runs). "\n" is a
-  // boundary the BPE won't merge across, so joining doesn't distort the count.
-  const joined = sections.filter((s) => s.length > 0).join("\n");
-  return joined.length === 0 ? 0 : Math.max(1, counter.count(joined));
+const countTranscript = (joined: string, counter: TTokenCounter): number =>
+  joined.length === 0 ? 0 : Math.max(1, counter.count(joined));
+
+/**
+ * Estimated `input_tokens` for an Anthropic-shaped Messages body — the answer
+ * `/v1/messages/count_tokens` serves ONLY as a fallback, when the vendor's own
+ * endpoint isn't reachable (no Anthropic-wire hop at the head of the chain, no
+ * local credential, or an upstream refusal). Whenever the vendor can be asked,
+ * its exact count is relayed instead and this function is not consulted.
+ *
+ * Always acquires a BPE counter — never a silent `chars/4` heuristic. Default
+ * encoding is {@link DEFAULT_ENCODING} (o200k) regardless of inbound Messages
+ * wire shape. Pass `"claude"` only when the caller is explicitly counting for
+ * an Anthropic-family hop.
+ *
+ * Single-sourced here because BOTH preflight paths need the same number: the
+ * cloud handler (`@openllm/api/handlers/count-tokens`) and the daemon's local
+ * surface (`runCountTokens` in the walker).
+ *
+ * KNOWN LIMIT — text only. Images and documents contribute nothing, so an
+ * image-heavy (or image-only) request UNDER-counts, materially. This is
+ * deliberate: Anthropic prices an image at roughly `(w × h) / 750` tokens, and
+ * neither dimension is recoverable from a base64 blob or a URL without decoding
+ * or fetching it — so any number we put there would be fabricated, and a
+ * fabricated count is worse than a knowingly-low one for a fallback whose
+ * consumers use it as a context-window indicator. Counting the blob's own length
+ * (what {@link estimateBodyTokens} does) is not a substitute: it tracks encoding
+ * size, not token cost, and overstates by orders of magnitude.
+ */
+export const estimateAnthropicInputTokens = async (
+  body: unknown,
+  encoding: TTokenEncoding = DEFAULT_ENCODING,
+): Promise<number> => {
+  const joined = visibleTranscriptOf(body);
+  if (joined.length === 0) return 0;
+  const counter = await getTokenCounter(encoding);
+  return countTranscript(joined, counter);
 };

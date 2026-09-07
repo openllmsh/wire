@@ -21,6 +21,7 @@ export * from "./features/max-tokens-backfill";
 export * from "./features/model-caps";
 export * from "./features/quota-gate";
 export * from "./lib/canonical/content-part";
+export * from "./lib/canonical/count-tokens-capability";
 export * from "./lib/canonical/message";
 export * from "./lib/canonical/token-estimate";
 export * from "./lib/encrypted-content";

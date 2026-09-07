@@ -65,10 +65,10 @@ export const getTokenCounter = (
 
 /**
  * Synchronously return an already-loaded counter, or `null` if the family
- * hasn't been warmed yet. Lets the (synchronous) estimators use the real ruler
- * when it's hot and fall back to the char heuristic on a cold isolate, without
- * forcing every caller onto an async signature. Pair with `getTokenCounter` at
- * a warmup point (e.g. request entry) to make the hot path the common one.
+ * hasn't been warmed yet. Used by the cheap routing helpers
+ * (`estimateBodyTokensExact`) that must stay sync. Client-facing preflight
+ * (`estimateAnthropicInputTokens`) always awaits {@link getTokenCounter}
+ * instead of peeking.
  */
 export const peekTokenCounter = (
   encoding: TTokenEncoding,
