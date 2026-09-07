@@ -49,7 +49,11 @@ export const isCountTokensUnsupported = (
   scope: TCountTokensCapabilityScope,
 ): boolean => {
   if (scope.endpointIdentity.length === 0) return false;
-  return unsupported.has(scopeKey(scope));
+  const k = scopeKey(scope);
+  if (!unsupported.has(k)) return false;
+  unsupported.delete(k);
+  unsupported.set(k, true);
+  return true;
 };
 
 export const rememberCountTokensUnsupported = (
