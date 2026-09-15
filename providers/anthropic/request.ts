@@ -245,7 +245,14 @@ const filePartToAnthropicBlock = (
   };
 };
 
-const contentToBlocks = (
+/**
+ * Canonical message content → ordered Anthropic content blocks (text, image,
+ * document). Exported because the daemon's Claude native tool path needs the
+ * SAME conversion for the active user turn it hands to the Agent SDK — wire
+ * stays the single owner of MIME / data-URL / source-variant handling rather
+ * than a second media hierarchy growing inside the daemon.
+ */
+export const anthropicContentBlocksOf = (
   content: TChatMessage["content"] | null | undefined,
 ): TAnthropicContentBlock[] => {
   if (content == null) return [];
@@ -398,7 +405,7 @@ const buildTurnMessages = (
     }
     flushToolResults();
     if (isUser(m)) {
-      const blocks = contentToBlocks(m.content);
+      const blocks = anthropicContentBlocksOf(m.content);
       if (blocks.length === 0) continue;
       applyMessageCacheControl(blocks, readCacheControl(m));
       // Collapse single bare-text block to a plain string for cleaner
