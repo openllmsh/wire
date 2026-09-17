@@ -155,7 +155,7 @@ const inspectWebp = (bytes: Uint8Array): TInspectedImage | null => {
     // lossy: bytes 16-19 are the "VP8 " chunk size, 20-22 the 3-byte VP8
     // frame tag, THEN the 0x9d 0x01 0x2a start code at 23-25, followed by
     // 16-bit width (26-27) / height (28-29). Verified against real
-    // cwebp-encoded output — see `tests/wire/image-signature-webp.test.ts`
+    // cwebp-encoded output — see `tests/transport/image-signature-webp.test.ts`
     // — a previous off-by-3 read the start code at 20-22 and dims at
     // 23/25, which never matched a real VP8 lossy stream.
     if (bytes.length < 30) return null;
