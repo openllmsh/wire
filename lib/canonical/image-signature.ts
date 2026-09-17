@@ -152,13 +152,18 @@ const inspectWebp = (bytes: Uint8Array): TInspectedImage | null => {
     return { mime: "image/webp", width, height };
   }
   if (fourcc === "VP8 ") {
-    // lossy: skip 4 chunk size, look for 0x9d 0x01 0x2a then 16-bit dims
+    // lossy: bytes 16-19 are the "VP8 " chunk size, 20-22 the 3-byte VP8
+    // frame tag, THEN the 0x9d 0x01 0x2a start code at 23-25, followed by
+    // 16-bit width (26-27) / height (28-29). Verified against real
+    // cwebp-encoded output — see `tests/wire/image-signature-webp.test.ts`
+    // — a previous off-by-3 read the start code at 20-22 and dims at
+    // 23/25, which never matched a real VP8 lossy stream.
     if (bytes.length < 30) return null;
-    if (bytes[20] !== 0x9d || bytes[21] !== 0x01 || bytes[22] !== 0x2a) {
+    if (bytes[23] !== 0x9d || bytes[24] !== 0x01 || bytes[25] !== 0x2a) {
       return null;
     }
-    const width = u16le(bytes, 23) & 0x3fff;
-    const height = u16le(bytes, 25) & 0x3fff;
+    const width = u16le(bytes, 26) & 0x3fff;
+    const height = u16le(bytes, 28) & 0x3fff;
     if (!validDims(width, height)) return null;
     return { mime: "image/webp", width, height };
   }
@@ -182,7 +187,9 @@ const inspectWebp = (bytes: Uint8Array): TInspectedImage | null => {
  * Sniff magic + dimensions. Returns null for truncated, oversized, unknown,
  * or out-of-range dimensions. Does not throw.
  */
-export const inspectImageBytes = (bytes: Uint8Array): TInspectedImage | null => {
+export const inspectImageBytes = (
+  bytes: Uint8Array,
+): TInspectedImage | null => {
   if (bytes.byteLength === 0 || bytes.byteLength > IMAGE_INSPECT_MAX_BYTES) {
     return null;
   }
