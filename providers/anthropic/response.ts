@@ -18,7 +18,10 @@ const finishReasonFor = (
     case "stop_sequence":
     case "pause_turn":
       return "stop";
+    // Both are truncation: the turn ended incomplete because it ran out of
+    // room. Canonical has one word for that.
     case "max_tokens":
+    case "model_context_window_exceeded":
       return "length";
     case "tool_use":
       return "tool_calls";
@@ -81,6 +84,27 @@ const blocksToText = (
   return parts.join("");
 };
 
+/**
+ * Extended-thinking text from a non-streaming Anthropic response.
+ *
+ * The streaming decoder already maps `thinking_delta` → canonical
+ * `reasoning_content` (see ./streaming.ts). Without the same mapping here,
+ * the SAME model on the SAME hop returned reasoning to a streaming client
+ * and silently dropped it for a non-streaming one. `redacted_thinking`
+ * carries no plaintext by construction, so it contributes nothing.
+ */
+const blocksToReasoning = (
+  blocks: ReadonlyArray<TAnthropicContentBlock>,
+): string =>
+  blocks
+    .filter(
+      (b): b is Extract<TAnthropicContentBlock, { type: "thinking" }> =>
+        b.type === "thinking",
+    )
+    .map((b) => b.thinking)
+    .filter((t) => t.length > 0)
+    .join("\n\n");
+
 const blocksToToolCalls = (
   blocks: ReadonlyArray<TAnthropicContentBlock>,
   options: TAnthropicWireOptions,
@@ -106,6 +130,7 @@ export const fromAnthropicResponse = (
   options: TAnthropicWireOptions,
 ): TChatCompletionResponse => {
   const text = blocksToText(resp.content);
+  const reasoning = blocksToReasoning(resp.content);
   const toolCalls = blocksToToolCalls(resp.content, options);
   const created = Math.floor(Date.now() / 1000);
   return {
@@ -119,6 +144,7 @@ export const fromAnthropicResponse = (
         message: {
           role: "assistant",
           content: text,
+          ...(reasoning.length > 0 ? { reasoning_content: reasoning } : {}),
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         },
         finish_reason: finishReasonFor(resp.stop_reason),

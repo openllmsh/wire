@@ -22,6 +22,8 @@
  * constants in `litellm/constants.py` — keep them in sync if those move.
  */
 
+import type { TModelCaps } from "@openllmsh/protocol";
+
 /**
  * Effort → thinking budget. Same numbers LiteLLM uses; single source of
  * truth — do NOT inline these values anywhere else.
@@ -69,15 +71,35 @@ export const REASONING_EFFORT_TO_OUTPUT_CONFIG_EFFORT = {
 export const ANTHROPIC_MIN_THINKING_BUDGET = 1024;
 
 /**
- * Models that do NOT accept the adaptive-thinking knobs. Deny-list (not
- * allow-list) so an unknown future opus/sonnet works without a code
- * change; the set of non-supporters is small and stable.
+ * Which thinking modes the resolved model accepts — read from the model
+ * card's `caps.thinkingModes`, never from the model NAME.
+ *
+ * This used to be two regex tables over model ids. That put model
+ * knowledge in the one package that must not have any, and it could not
+ * be right for long: support is NON-monotonic within a family (4.5
+ * extended-only, 4.6 both, 4.7+ adaptive-only), so no prefix encodes it
+ * and every new model needed a wire-package edit. The catalog owns the
+ * table now; these helpers only interpret it.
+ *
+ * ABSENT OR EMPTY IS PERMISSIVE on both questions. A custom endpoint, a
+ * passthrough hop, or a model the catalog has not caught up with must
+ * never be refused locally for a request the upstream might accept —
+ * manufacturing a validation error from missing metadata would be a
+ * worse failure than the one it prevents.
  */
-const NO_ADAPTIVE_THINKING = /haiku|claude-3|claude-instant/i;
+const declaredModes = (
+  caps: TModelCaps | undefined,
+): ReadonlyArray<string> | null => {
+  const modes = caps?.thinkingModes;
+  return modes !== undefined && modes.length > 0 ? modes : null;
+};
 
-export const supportsAdaptiveThinking = (model: unknown): boolean => {
-  if (typeof model !== "string" || model.length === 0) return true;
-  return !NO_ADAPTIVE_THINKING.test(model);
+/** True unless the card explicitly declares modes WITHOUT `adaptive`. */
+export const supportsAdaptiveThinking = (
+  caps: TModelCaps | undefined,
+): boolean => {
+  const modes = declaredModes(caps);
+  return modes === null || modes.includes("adaptive");
 };
 
 const readEffort = (v: unknown): TReasoningEffort | undefined => {
@@ -143,11 +165,11 @@ export type TThinkingFromEffort = {
 
 export const mapReasoningEffortToAnthropic = (
   effort: TReasoningEffortInput,
-  model: string,
+  caps: TModelCaps | undefined,
   maxTokens: number | undefined,
 ): TThinkingFromEffort | null => {
   if (effort === "none") return null;
-  if (supportsAdaptiveThinking(model)) {
+  if (supportsAdaptiveThinking(caps)) {
     return {
       thinking: { type: "adaptive" },
       output_config: {
@@ -204,9 +226,12 @@ const filterClearThinking = (cm: unknown): unknown | undefined => {
  * copy otherwise. Caller-provided `tools`, `system`, `metadata`,
  * `cache_control`, beta headers, etc. are never inspected.
  */
-export const normaliseAdaptiveThinking = (body: unknown): unknown => {
+export const normaliseAdaptiveThinking = (
+  body: unknown,
+  caps: TModelCaps | undefined,
+): unknown => {
   if (!isObject(body)) return body;
-  if (supportsAdaptiveThinking(body.model)) return body;
+  if (supportsAdaptiveThinking(caps)) return body;
 
   const {
     output_config,

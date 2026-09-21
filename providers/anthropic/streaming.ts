@@ -30,7 +30,10 @@ const finishReasonFor = (
     case "stop_sequence":
     case "pause_turn":
       return "stop";
+    // Both are truncation: the turn ended incomplete because it ran out of
+    // room. Canonical has one word for that.
     case "max_tokens":
+    case "model_context_window_exceeded":
       return "length";
     case "tool_use":
       return "tool_calls";

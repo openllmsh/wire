@@ -194,11 +194,18 @@ export const canonicalToUpstreamBody = (
   // → inject (Codex default); `false` suppresses it for non-Codex Responses-wire
   // providers (xAI Grok). No effect for the anthropic / openai wires.
   codexInstructions?: boolean,
+  // Resolved model card caps. Only the anthropic encoder reads them today
+  // (`thinkingModes` decides which thinking mode an inferred
+  // `reasoning_effort` maps to). Absent = unknown = permissive.
+  caps?: TModelCaps,
 ): Record<string, unknown> => {
+  const options = { providerModelId, ...(caps !== undefined ? { caps } : {}) };
   if (upstreamWire === "chatgpt") {
-    return toChatGptRequest(canonical, { providerModelId, codexInstructions });
+    // Caps reach this encoder too: `reasoningContexts` is how it learns a
+    // model rejects `reasoning.context: "all_turns"` (the Codex spark family),
+    // a fact it used to read off the model id.
+    return toChatGptRequest(canonical, { ...options, codexInstructions });
   }
-  const options = { providerModelId };
   if (upstreamWire === "anthropic") {
     return { ...toAnthropicRequest(canonical, options), stream };
   }
@@ -240,7 +247,8 @@ export const buildUpstreamBody = (
   // Responses-shaped). Only the model id + stream flag are pinned. The
   // Anthropic passthrough additionally normalises adaptive-thinking knobs
   // (`thinking:adaptive` / `output_config.effort` / top-level `effort`) for
-  // the RESOLVED model — they 400 on haiku/claude-3.
+  // the RESOLVED model, which rejects them unless its card declares
+  // `adaptive` in `caps.thinkingModes`. No card = no rewrite.
   if (upstreamWire === clientWireOf(surface) && surface !== "responses") {
     // Pin the concrete model id + stream flag. The daemon always supplies a
     // resolved `providerModelId` (off the 307); the cloud passthrough (whose
@@ -268,6 +276,7 @@ export const buildUpstreamBody = (
             hoistInlineAnthropicSystemMessages(
               normaliseAnthropicNativeTools(pinned),
             ),
+            caps,
           )
         : pinned;
     return finalizeUpstreamBody(
@@ -286,6 +295,7 @@ export const buildUpstreamBody = (
       providerModelId,
       stream ?? false,
       codexInstructions,
+      caps,
     ),
     provider,
     caps,

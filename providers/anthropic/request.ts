@@ -446,14 +446,30 @@ const toAnthropicTool = (
   };
 };
 
+/**
+ * Canonical `tool_choice` → Anthropic, carrying `parallel_tool_calls`
+ * across as `disable_parallel_tool_use` (opposite polarity, same intent).
+ *
+ * `tool_choice: "none"` is the one shape that cannot carry the flag on the
+ * Anthropic wire, and it is also the one shape where the flag is moot —
+ * no tools will be called at all.
+ */
 const toAnthropicToolChoice = (
   choice: NonNullable<TChatCompletionRequest["tool_choice"]>,
   names: TToolNameMaps,
+  disableParallel: boolean,
 ): TAnthropicRequest["tool_choice"] => {
-  if (choice === "auto") return { type: "auto" };
-  if (choice === "required") return { type: "any" };
+  const parallel = disableParallel
+    ? { disable_parallel_tool_use: true as const }
+    : {};
+  if (choice === "auto") return { type: "auto", ...parallel };
+  if (choice === "required") return { type: "any", ...parallel };
   if (choice === "none") return { type: "none" };
-  return { type: "tool", name: outboundToolName(choice.function.name, names) };
+  return {
+    type: "tool",
+    name: outboundToolName(choice.function.name, names),
+    ...parallel,
+  };
 };
 
 type TSystemTextBlock = {
@@ -545,10 +561,18 @@ export const toAnthropicRequest = (
         : undefined;
 
   const tools = req.tools?.map((tool) => toAnthropicTool(tool, names));
+  // `parallel_tool_calls: false` is the client asking for ONE tool call per
+  // turn. Anthropic spells that `tool_choice.disable_parallel_tool_use`, so
+  // it needs a `tool_choice` to ride on — synthesize the `auto` default the
+  // client was already getting when they sent no explicit choice, rather
+  // than dropping the instruction (the previous behaviour).
+  const disableParallel = req.parallel_tool_calls === false;
   const toolChoice =
     req.tool_choice !== undefined
-      ? toAnthropicToolChoice(req.tool_choice, names)
-      : undefined;
+      ? toAnthropicToolChoice(req.tool_choice, names, disableParallel)
+      : disableParallel && tools !== undefined && tools.length > 0
+        ? ({ type: "auto", disable_parallel_tool_use: true } as const)
+        : undefined;
 
   // `reasoning_effort` → Anthropic extended thinking. Single source of
   // truth in `./adaptive-thinking.ts`; this is the only call site on
@@ -557,7 +581,7 @@ export const toAnthropicRequest = (
     req.reasoning_effort !== undefined
       ? mapReasoningEffortToAnthropic(
           req.reasoning_effort,
-          options.providerModelId,
+          options.caps,
           max_tokens,
         )
       : null;

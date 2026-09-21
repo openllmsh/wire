@@ -147,8 +147,40 @@ const blockToCanonicalPart = (
       text: "[container upload omitted — code-execution file references are not supported by this provider]",
     };
   }
+  if (CROSS_WIRE_UNSUPPORTED_BLOCK_TYPES.has(block.type)) {
+    // Server-tool blocks Anthropic RETURNS and the client replays as
+    // history. There is no canonical carrier for any of them, and
+    // inventing one would be a guess at semantics we cannot verify — so
+    // name the loss instead of vanishing the block. These block types were
+    // previously rejected by the request decoder; this annotation supports
+    // newly accepted history without implying their semantics are preserved.
+    return {
+      type: "text",
+      text: `[${block.type} omitted — provider-executed tool results are not supported by this provider]`,
+    };
+  }
   return null;
 };
+
+/**
+ * Anthropic content blocks with no canonical (OpenAI-shaped) equivalent.
+ *
+ * These decode fine — they must, or the gateway 400s its own upstream's
+ * output — but they cannot cross to a non-Anthropic provider intact.
+ * `blockToCanonicalPart` degrades them to a NAMED annotation rather than
+ * dropping them silently.
+ */
+const CROSS_WIRE_UNSUPPORTED_BLOCK_TYPES: ReadonlySet<string> = new Set([
+  "web_fetch_tool_result",
+  "code_execution_tool_result",
+  "bash_code_execution_tool_result",
+  "text_editor_code_execution_tool_result",
+  "tool_search_tool_result",
+  "mcp_tool_use",
+  "mcp_tool_result",
+  "tool_reference",
+  "browser_state",
+]);
 
 const blocksToCanonicalContent = (
   blocks: ReadonlyArray<TAnthropicContentBlock>,
@@ -309,6 +341,26 @@ const anthropicToolChoiceToOpenAI = (
 };
 
 /**
+ * Anthropic `tool_choice.disable_parallel_tool_use` → canonical
+ * `parallel_tool_calls`. The two express the same intent with opposite
+ * polarity, so this is a translation, not a drop — previously the flag was
+ * accepted and then discarded, silently re-enabling parallel tool calls on
+ * every cross-provider hop.
+ *
+ * Only `false` is emitted: `disable_parallel_tool_use: false` is already
+ * the provider default on both wires, so asserting `true` would add a
+ * field the client never sent.
+ */
+const parallelToolCallsFrom = (
+  choice: TAnthropicRequest["tool_choice"],
+): false | undefined =>
+  choice !== undefined &&
+  choice.type !== "none" &&
+  choice.disable_parallel_tool_use === true
+    ? false
+    : undefined;
+
+/**
  * Walk an Anthropic-style message and emit the canonical OpenAI
  * message(s). An assistant turn with mixed text + tool_use blocks
  * yields ONE assistant message carrying both `content` (text) and
@@ -376,7 +428,20 @@ const splitAnthropicMessage = (m: TAnthropicMessage): TChatMessage[] => {
   }
 
   // assistant
-  const text = extractTextFromBlocks(m.content);
+  // Assistant turns carry provider-executed tool blocks too (the client
+  // replays them verbatim as history). `extractTextFromBlocks` sees only
+  // `text`, so without this every one of them vanished from the
+  // conversation on a cross-provider hop — the model then had no record
+  // that a web fetch / code execution / MCP call ever happened.
+  const unsupportedNotes = m.content
+    .filter((b) => CROSS_WIRE_UNSUPPORTED_BLOCK_TYPES.has(b.type))
+    .map(
+      (b) =>
+        `[${b.type} omitted — provider-executed tool results are not supported by this provider]`,
+    );
+  const text = [extractTextFromBlocks(m.content), ...unsupportedNotes]
+    .filter((s) => s.length > 0)
+    .join("\n");
   const toolCalls = m.content
     .filter(
       (b): b is Extract<TAnthropicContentBlock, { type: "tool_use" }> =>
@@ -470,6 +535,8 @@ export const fromAnthropicMessagesRequest = (
       ? anthropicToolChoiceToOpenAI(req.tool_choice)
       : undefined;
 
+  const parallelToolCalls = parallelToolCallsFrom(req.tool_choice);
+
   const reasoningEffort = reasonEffortFromThinking(req);
 
   return {
@@ -484,6 +551,9 @@ export const fromAnthropicMessagesRequest = (
     ...(req.stream !== undefined ? { stream: req.stream } : {}),
     ...(tools !== undefined && tools.length > 0 ? { tools } : {}),
     ...(toolChoice !== undefined ? { tool_choice: toolChoice } : {}),
+    ...(parallelToolCalls !== undefined
+      ? { parallel_tool_calls: parallelToolCalls }
+      : {}),
     ...(reasoningEffort !== undefined
       ? { reasoning_effort: reasoningEffort }
       : {}),

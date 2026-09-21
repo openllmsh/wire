@@ -2,6 +2,7 @@ import type {
   TChatCompletionRequest,
   TChatGptProviderOptions,
   TChatMessage,
+  TModelCaps,
 } from "@openllmsh/protocol";
 import type { TReasoningResponsesInput } from "../../adapters/messages/reasoning-signature";
 import {
@@ -677,13 +678,24 @@ const toResponsesToolChoice = (
  * tiers are deliberately NOT used — both Lite and full Responses can serve the
  * same catalog ids.
  */
-// The Codex "spark" family (e.g. `gpt-5.3-codex-spark`) rejects
-// `reasoning.context: "all_turns"` with a 400 — it only accepts `auto` and
-// `current_turn`. Every other Codex model requires `all_turns`. Detect spark
-// by model-id suffix (mirrors CLIProxyAPI's `strings.HasSuffix(baseModel,
-// "spark")`) and omit `context` for it, falling back to the backend default.
-const isCodexSparkModel = (modelId: string): boolean =>
-  modelId.toLowerCase().endsWith("spark");
+/**
+ * Whether this hop accepts `reasoning.context: "all_turns"`.
+ *
+ * The fact is catalog-owned (`caps.reasoningContexts`), NOT derived from the
+ * model id. It used to be `modelId.toLowerCase().endsWith("spark")`, which
+ * made the encoder guess a model fact from a name: a renamed or newly shipped
+ * spark model silently changed behaviour, and a non-spark model that happened
+ * to end in those five letters was mis-served. The Codex `spark` family 400s
+ * on `all_turns` and accepts only `auto` / `current_turn`; every other Codex
+ * model requires `all_turns`.
+ *
+ * Absent caps = unknown = PERMISSIVE (emit `all_turns`), which is what every
+ * non-spark Codex model needs. Un-catalogued spark ids are covered by the
+ * catalog's own default rules, not by this adapter.
+ */
+const acceptsAllTurnsContext = (caps: TModelCaps | undefined): boolean =>
+  caps?.reasoningContexts === undefined ||
+  caps.reasoningContexts.includes("all_turns");
 
 const isCodexResponsesLite = (clientMetadata: unknown): boolean => {
   if (
@@ -745,9 +757,9 @@ export type TChatGptRequestBody = {
   // maps `response.reasoning_summary_text.delta` → `reasoning_content`.
   // `context: "all_turns"` is REQUIRED by the ChatGPT Codex "Responses-Lite"
   // backend (gpt-5.6-terra/luna) and sent natively by codex v0.147. Codex path
-  // only — the Grok chat proxy rejects it, so it's omitted there. The Codex
-  // `spark` family also rejects it (only `auto`/`current_turn`), so it's
-  // omitted for spark too — see `isCodexSparkModel`.
+  // only — the Grok chat proxy rejects it, so it's omitted there. A model whose
+  // card says it does not accept `all_turns` (the Codex `spark` family) also
+  // omits it — see `acceptsAllTurnsContext`.
   readonly reasoning?: {
     readonly effort: "low" | "medium" | "high";
     readonly summary: "auto";
@@ -900,10 +912,10 @@ export const toChatGptRequest = (
         reasoning: {
           effort,
           summary: "auto" as const,
-          // Codex path requires `context: "all_turns"`, except the spark
-          // family which 400s on it (accepts only `auto`/`current_turn`).
+          // Codex path requires `context: "all_turns"`, except a model whose
+          // card declares it unaccepted (the spark family 400s on it).
           ...(options.codexInstructions !== false &&
-          !isCodexSparkModel(options.providerModelId)
+          acceptsAllTurnsContext(options.caps)
             ? { context: "all_turns" as const }
             : {}),
         },
