@@ -79,7 +79,7 @@ const isAssistantWithThinking = (msg: unknown): boolean => {
   if (msg === null || typeof msg !== "object") return false;
   if ((msg as { role?: unknown }).role !== "assistant") return false;
   const content = messageContent(msg);
-  return content !== null && content.some(isThinkingBlock);
+  return content?.some(isThinkingBlock) ?? false;
 };
 
 /**
@@ -108,9 +108,7 @@ const isActiveToolUseContinuation = (
   const curContent = messageContent(cur);
   const nextContent = messageContent(next);
   if (curContent === null || nextContent === null) return false;
-  return (
-    curContent.some(isToolUseBlock) && nextContent.some(isToolResultBlock)
-  );
+  return curContent.some(isToolUseBlock) && nextContent.some(isToolResultBlock);
 };
 
 /** True when a built Anthropic Messages body carries at least one assistant

@@ -134,6 +134,9 @@ export const captureForwardableHeaders = (
 const ORIGINATOR_DENY_EXACT: ReadonlySet<string> = new Set([
   "authorization",
   "x-api-key",
+  // The per-boot local caller token is a loopback-only credential — it must
+  // never reach a vendor upstream even when a first-party client presents it.
+  "x-openllm-local-token",
   "host",
   "content-length",
   "content-type",

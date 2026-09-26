@@ -559,7 +559,10 @@ const makeUniqueToolName = (
   if (!used.has(base)) return base;
   for (let suffixNumber = 1; ; suffixNumber++) {
     const suffix = `_${suffixNumber}`;
-    const prefixLength = Math.max(0, CODEX_IDENTIFIER_MAX_LENGTH - suffix.length);
+    const prefixLength = Math.max(
+      0,
+      CODEX_IDENTIFIER_MAX_LENGTH - suffix.length,
+    );
     const candidate = `${base.slice(0, prefixLength)}${suffix}`;
     if (!used.has(candidate)) return candidate;
   }
@@ -627,19 +630,40 @@ const toolsToResponses = (
   }));
 
 /**
+ * Harness-only keys Codex attaches to its built-in tools that the upstream
+ * Responses endpoint REJECTS outright (`400 Argument not supported: …`).
+ * `external_web_access` rides Codex's `web_search` tool. Stripping only these
+ * named keys keeps every other key round-tripping verbatim.
+ */
+const HARNESS_ONLY_TOOL_KEYS = ["external_web_access"] as const;
+
+const stripHarnessOnlyToolKeys = <T>(tool: T): T => {
+  if (tool === null || typeof tool !== "object") return tool;
+  const rec = tool as Record<string, unknown>;
+  // false is a restriction, not a disposable compatibility hint. Retain it
+  // even when a backend rejects it; removing it can authorize live access.
+  if (rec.external_web_access === false) return tool;
+  if (!HARNESS_ONLY_TOOL_KEYS.some((key) => key in rec)) return tool;
+  const next: Record<string, unknown> = { ...rec };
+  for (const key of HARNESS_ONLY_TOOL_KEYS) delete next[key];
+  return next as T;
+};
+
+/**
  * Sanitize the verbatim `responses_tools` passthrough (Codex's original tool
  * set). Function tools carry a JSON-schema `parameters` and so are subject to
  * the same lookaround-`pattern` 400 as {@link toolsToResponses} — this is
  * actually the path real Codex traffic takes. Non-function tools
- * (`web_search`, `apply_patch`, `image_generation`, `tool_search`, …) must
- * round-trip byte-identical, since they're opaque and re-emitted as-is.
+ * (`web_search`, `apply_patch`, `image_generation`, `tool_search`, …) are
+ * opaque and otherwise re-emitted as-is, EXCEPT for the harness-only keys
+ * above that the upstream endpoint refuses.
  */
 const sanitizeResponsesTools = (
   tools: ReadonlyArray<TResponsesPassthroughToolDef>,
   toolNames: ReadonlyMap<string, string>,
 ): ReadonlyArray<TResponsesPassthroughToolDef> =>
   tools.map((tool) => {
-    if (tool.type !== "function") return tool;
+    if (tool.type !== "function") return stripHarnessOnlyToolKeys(tool);
     return {
       ...tool,
       ...(typeof tool.name === "string"
@@ -823,7 +847,18 @@ export const toChatGptRequest = (
     | undefined =
     req.responses_tools !== undefined && req.responses_tools.length > 0
       ? sanitizeResponsesTools(
-          req.responses_tools as ReadonlyArray<TResponsesPassthroughToolDef>,
+          // Namespace declarations belong to the Codex harness contract.
+          // Grok shares the Responses envelope but rejects this tool variant.
+          (isCodex
+            ? req.responses_tools
+            : req.responses_tools.filter(
+                (tool) =>
+                  !(
+                    typeof tool === "object" &&
+                    tool !== null &&
+                    (tool as { type?: unknown }).type === "namespace"
+                  ),
+              )) as ReadonlyArray<TResponsesPassthroughToolDef>,
           toolNameMaps.outbound,
         )
       : req.tools !== undefined && req.tools.length > 0
