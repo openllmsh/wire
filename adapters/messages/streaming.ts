@@ -14,6 +14,7 @@ import {
   encodeReasoningSignature,
   reasoningItemsFromUnknown,
 } from "./reasoning-signature";
+import { anthropicMessagesUsageFromInclusive } from "./usage";
 
 type TDeltaFoldMode = "incremental" | "snapshot";
 
@@ -668,6 +669,8 @@ export const chunkToMessagesEvents = (
   // of staying at zero until completion. No `stop_reason`, no
   // `message_stop`: the turn is still open and the terminal
   // `message_delta` below reconciles to the provider's exact totals.
+  // Normalize only at emit: `state.inputTokens` stays inclusive so EOF
+  // can re-inject OpenAI-shaped `prompt_tokens` without a second subtract.
   if (
     chunk.usage != null &&
     !turnEnds &&
@@ -677,16 +680,12 @@ export const chunkToMessagesEvents = (
     out.push({
       type: "message_delta",
       delta: { stop_reason: null, stop_sequence: null },
-      usage: {
-        output_tokens: chunk.usage.completion_tokens,
-        input_tokens: state.inputTokens,
-        ...(state.cacheCreationTokens > 0
-          ? { cache_creation_input_tokens: state.cacheCreationTokens }
-          : {}),
-        ...(state.cacheReadTokens > 0
-          ? { cache_read_input_tokens: state.cacheReadTokens }
-          : {}),
-      },
+      usage: anthropicMessagesUsageFromInclusive({
+        promptTokens: state.inputTokens,
+        completionTokens: chunk.usage.completion_tokens,
+        cachedTokens: state.cacheReadTokens,
+        cacheCreationTokens: state.cacheCreationTokens,
+      }),
     });
   }
 
@@ -774,14 +773,12 @@ export const chunkToMessagesEvents = (
         stop_sequence: null,
       },
       usage: {
-        output_tokens: outputTokens,
-        input_tokens: state.inputTokens,
-        ...(state.cacheCreationTokens > 0
-          ? { cache_creation_input_tokens: state.cacheCreationTokens }
-          : {}),
-        ...(state.cacheReadTokens > 0
-          ? { cache_read_input_tokens: state.cacheReadTokens }
-          : {}),
+        ...anthropicMessagesUsageFromInclusive({
+          promptTokens: state.inputTokens,
+          completionTokens: outputTokens,
+          cachedTokens: state.cacheReadTokens,
+          cacheCreationTokens: state.cacheCreationTokens,
+        }),
         ...(state.serverSearchCount > 0
           ? {
               server_tool_use: {
@@ -886,11 +883,29 @@ export const chunksToMessagesSseBytes = (
                   // The trailer was already consumed; fold last-seen
                   // usage onto this finish chunk so the terminal
                   // `message_delta` reconciles to the provider totals
-                  // instead of `output_tokens: 0`.
+                  // instead of `output_tokens: 0`. Keep cache details so
+                  // re-injection does not wipe inclusive state buckets
+                  // before the exclusive Anthropic emit.
                   usage: {
                     prompt_tokens: state.inputTokens,
                     completion_tokens: state.outputTokens,
                     total_tokens: state.inputTokens + state.outputTokens,
+                    ...(state.cacheReadTokens > 0 ||
+                    state.cacheCreationTokens > 0
+                      ? {
+                          prompt_tokens_details: {
+                            ...(state.cacheReadTokens > 0
+                              ? { cached_tokens: state.cacheReadTokens }
+                              : {}),
+                            ...(state.cacheCreationTokens > 0
+                              ? {
+                                  cache_creation_tokens:
+                                    state.cacheCreationTokens,
+                                }
+                              : {}),
+                          },
+                        }
+                      : {}),
                   },
                   choices: [
                     {

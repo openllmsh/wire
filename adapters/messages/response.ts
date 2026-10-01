@@ -15,6 +15,7 @@ import {
   encodeReasoningSignature,
   reasoningItemsFromUnknown,
 } from "./reasoning-signature";
+import { anthropicMessagesUsageFromInclusive } from "./usage";
 
 const extractText = (
   content: TChatCompletionResponse["choices"][number]["message"]["content"],
@@ -173,19 +174,16 @@ export const toAnthropicMessagesResponse = (
     }
   }
 
-  const cached = resp.usage.prompt_tokens_details?.cached_tokens ?? 0;
-  const created = resp.usage.prompt_tokens_details?.cache_creation_tokens ?? 0;
-
-  // Anthropic's `input_tokens` EXCLUDES cache reads and cache-creation
-  // tokens — they are reported in their own fields. OpenAI's
-  // `prompt_tokens` INCLUDES `prompt_tokens_details.cached_tokens` (and,
-  // for providers that report it, the creation tokens). Returning
-  // `prompt_tokens` verbatim as `input_tokens` while ALSO surfacing
-  // `cache_read_input_tokens` double-counts cached prompt tokens and
-  // over-bills every cached request. Mirror LiteLLM: subtract the cache
-  // tokens back out, flooring at 0. Ref: litellm
-  // `adapters/transformation.py` usage mapping (~lines 1326-1357).
-  const inputTokens = Math.max(0, resp.usage.prompt_tokens - cached - created);
+  // Anthropic's `input_tokens` EXCLUDES cache reads/creation; OpenAI's
+  // `prompt_tokens` includes them. Shared helper keeps streaming + direct
+  // Messages encoders on the same contract.
+  const usage = anthropicMessagesUsageFromInclusive({
+    promptTokens: resp.usage.prompt_tokens,
+    completionTokens: resp.usage.completion_tokens,
+    cachedTokens: resp.usage.prompt_tokens_details?.cached_tokens,
+    cacheCreationTokens:
+      resp.usage.prompt_tokens_details?.cache_creation_tokens,
+  });
 
   return {
     id: resp.id,
@@ -196,10 +194,7 @@ export const toAnthropicMessagesResponse = (
     stop_reason: stopReason,
     stop_sequence: null,
     usage: {
-      input_tokens: inputTokens,
-      output_tokens: resp.usage.completion_tokens,
-      ...(cached > 0 ? { cache_read_input_tokens: cached } : {}),
-      ...(created > 0 ? { cache_creation_input_tokens: created } : {}),
+      ...usage,
       ...(serverSearches.length > 0
         ? { server_tool_use: { web_search_requests: serverSearches.length } }
         : {}),
