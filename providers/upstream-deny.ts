@@ -26,6 +26,7 @@
  */
 
 import type { TModelCaps } from "@openllmsh/protocol";
+import { codexServiceTier } from "@openllmsh/protocol";
 import { applyModelCaps } from "../features/model-caps";
 
 export type TParamWire = "anthropic" | "chatgpt" | "openai";
@@ -332,6 +333,13 @@ export const droppedSignalParams = (
   return SIGNAL_FIELDS.filter(
     (field): boolean =>
       Object.hasOwn(request, field) &&
+      !(
+        field === "service_tier" &&
+        wire === "chatgpt" &&
+        provider === "chatgpt" &&
+        (request[field] === "default" ||
+          codexServiceTier(request[field]) !== null)
+      ) &&
       (denied.has(field) || omitted.has(field)),
   );
 };

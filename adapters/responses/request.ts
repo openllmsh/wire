@@ -217,6 +217,7 @@ export const fromResponsesRequest = (
       : {}),
     ...(req.temperature != null ? { temperature: req.temperature } : {}),
     ...(req.top_p != null ? { top_p: req.top_p } : {}),
+    ...(req.service_tier != null ? { service_tier: req.service_tier } : {}),
     ...(req.parallel_tool_calls != null
       ? { parallel_tool_calls: req.parallel_tool_calls }
       : {}),

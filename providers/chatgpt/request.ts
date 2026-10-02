@@ -4,6 +4,7 @@ import type {
   TChatMessage,
   TModelCaps,
 } from "@openllmsh/protocol";
+import { codexServiceTier } from "@openllmsh/protocol";
 import type { TReasoningResponsesInput } from "../../adapters/messages/reasoning-signature";
 import {
   reasoningItemsFromUnknown,
@@ -559,7 +560,10 @@ const makeUniqueToolName = (
   if (!used.has(base)) return base;
   for (let suffixNumber = 1; ; suffixNumber++) {
     const suffix = `_${suffixNumber}`;
-    const prefixLength = Math.max(0, CODEX_IDENTIFIER_MAX_LENGTH - suffix.length);
+    const prefixLength = Math.max(
+      0,
+      CODEX_IDENTIFIER_MAX_LENGTH - suffix.length,
+    );
     const candidate = `${base.slice(0, prefixLength)}${suffix}`;
     if (!used.has(candidate)) return candidate;
   }
@@ -733,6 +737,7 @@ export type TChatGptRequestBody = {
   readonly instructions: string;
   readonly stream: true;
   readonly store: false;
+  readonly service_tier?: string;
   readonly include: ReadonlyArray<string>;
   // Responses-Lite requires false; full Codex Responses requires true. The
   // authoritative Lite marker lives in `client_metadata`, never a model id.
@@ -802,6 +807,7 @@ export const toChatGptRequest = (
     req.messages,
   );
   const isCodex = options.codexInstructions !== false;
+  const serviceTier = isCodex ? codexServiceTier(req.service_tier) : null;
   // Assign names once so function definitions, tool choices, and replayed
   // assistant calls all use the same final identifier.
   const toolNameMaps = buildChatGptToolNameMaps(req);
@@ -836,6 +842,7 @@ export const toChatGptRequest = (
     instructions: "",
     stream: true,
     store: false,
+    ...(serviceTier !== null ? { service_tier: serviceTier } : {}),
     include: ["reasoning.encrypted_content"],
     // Lite always disables parallel calls. Full Codex honors an explicit client
     // value and otherwise preserves Codex's default of parallel calls enabled.

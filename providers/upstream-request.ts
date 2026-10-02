@@ -2,10 +2,12 @@ import type {
   TAnthropicRequest,
   TChatCompletionRequest,
   TModelCaps,
+  TModelSettings,
   TResponsesRequest,
 } from "@openllmsh/protocol";
 import { fromAnthropicMessagesRequest } from "../adapters/messages/request";
 import { fromResponsesRequest } from "../adapters/responses";
+import { applyModelSettings } from "../features/model-settings";
 import { requestHasImageContent } from "../lib/canonical/content-part";
 import { normaliseAdaptiveThinking } from "./anthropic/adaptive-thinking";
 import {
@@ -241,6 +243,7 @@ export const buildUpstreamBody = (
   // Codex-preamble injection for the chatgpt wire (see canonicalToUpstreamBody).
   codexInstructions?: boolean,
   caps?: TModelCaps,
+  modelSettings?: TModelSettings,
 ): Record<string, unknown> => {
   // No Claude launch-overlay prefix is injected.
   // Passthrough: same wire in + out (NEVER for `responses` — its body is
@@ -255,7 +258,10 @@ export const buildUpstreamBody = (
     // body already carries the right model) passes the body's own model — and
     // an empty id means "preserve the body's model", so it stays a true
     // passthrough.
-    const raw = rawBody as Record<string, unknown>;
+    const raw =
+      upstreamWire === "openai"
+        ? applyModelSettings(rawBody as TChatCompletionRequest, modelSettings)
+        : (rawBody as Record<string, unknown>);
     const effectiveStream = stream ?? raw.stream === true;
     const pinned = {
       ...raw,
@@ -290,7 +296,7 @@ export const buildUpstreamBody = (
   return finalizeUpstreamBody(
     canonicalToUpstreamBody(
       upstreamWire,
-      canonicalFromInbound(surface, rawBody),
+      applyModelSettings(canonicalFromInbound(surface, rawBody), modelSettings),
       provider,
       providerModelId,
       stream ?? false,
@@ -396,6 +402,7 @@ export type TBuildUpstreamRequestInput = {
   readonly codexInstructions?: boolean;
   /** Catalog-declared final outbound-body constraints for the resolved hop. */
   readonly caps?: TModelCaps;
+  readonly modelSettings?: TModelSettings;
   /**
    * Catalog capabilities for the resolved hop. Empty / missing = unknown
    * (custom / passthrough) — never treated as non-vision. The vision
@@ -533,6 +540,7 @@ export const buildUpstreamRequest = (
       i.stream,
       i.codexInstructions,
       i.caps,
+      i.modelSettings,
     ),
     headers: buildUpstreamHeaders(i),
   };
