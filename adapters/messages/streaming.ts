@@ -11,6 +11,9 @@ import {
 } from "./anthropic-map";
 import { plainTextFromReasoningItems } from "./reasoning-from-items";
 import {
+  CLAUDE_NATIVE_ASSISTANT_CARRIER,
+  CLAUDE_NATIVE_ASSISTANT_PENDING,
+  encodeNativeAssistantSignature,
   encodeReasoningSignature,
   reasoningItemsFromUnknown,
 } from "./reasoning-signature";
@@ -111,6 +114,8 @@ export type TMessagesStreamState = {
    * two identical ⏺ prompts around "Thought for 1s".
    */
   signedReasoningChannel: boolean;
+  /** Native projection-checked history must keep visible text byte-exact. */
+  nativeAssistantChannel: boolean;
   /** True after a signed thinking block was sealed this turn. */
   sealedSignedThinking: boolean;
   /** Provider-executed hosted searches emitted so far — drives the terminal
@@ -145,6 +150,7 @@ export const newMessagesStreamState = (): TMessagesStreamState => ({
   thinkingDeltaEmittedLen: 0,
   pendingReasoningSignature: null,
   signedReasoningChannel: false,
+  nativeAssistantChannel: false,
   sealedSignedThinking: false,
   serverSearchCount: 0,
 });
@@ -437,6 +443,17 @@ export const chunkToMessagesEvents = (
   const deltaReasoning = choice?.delta.reasoning_content ?? null;
   const deltaText = choice?.delta.content ?? null;
   const deltaToolCalls = choice?.delta.tool_calls ?? null;
+  if (
+    choice?.delta.reasoning_items?.some((item) => {
+      if (typeof item !== "object" || item === null) return false;
+      const type = (item as { type?: unknown }).type;
+      return (
+        type === CLAUDE_NATIVE_ASSISTANT_CARRIER ||
+        type === CLAUDE_NATIVE_ASSISTANT_PENDING
+      );
+    })
+  )
+    state.nativeAssistantChannel = true;
 
   // Responses hops tag summary deltas with `reasoning_items` (empty
   // array = channel marker; later chunks carry the encrypted item).
@@ -478,8 +495,11 @@ export const chunkToMessagesEvents = (
   const reasoningItems = reasoningItemsFromUnknown(
     choice?.delta.reasoning_items,
   );
-  if (reasoningItems.length > 0) {
-    const sig = encodeReasoningSignature(reasoningItems);
+  const nativeSignature = encodeNativeAssistantSignature(
+    choice?.delta.reasoning_items,
+  );
+  if (reasoningItems.length > 0 || nativeSignature !== null) {
+    const sig = nativeSignature ?? encodeReasoningSignature(reasoningItems);
     if (sig !== null) {
       // A distinct new signature while one is still pending (Grok interleaves
       // multiple reasoning items) — seal the prior item as its own thinking
@@ -588,7 +608,11 @@ export const chunkToMessagesEvents = (
     );
     state.contentSnapshotAccumulated = textSnap.next;
     let emit = textSnap.emit;
-    if (state.signedReasoningChannel && state.thinkingAccumulated.length > 0) {
+    if (
+      !state.nativeAssistantChannel &&
+      state.signedReasoningChannel &&
+      state.thinkingAccumulated.length > 0
+    ) {
       const desired = visibleAnswerAfterThought(
         state.contentSnapshotAccumulated,
         state.thinkingAccumulated,
@@ -714,7 +738,11 @@ export const chunkToMessagesEvents = (
     }
     state.finalStopReason = finalStopReason;
     closeThinkingBlock(state, out);
-    if (state.textBlockOpen && state.textBlockIndex !== null) {
+    if (
+      !state.nativeAssistantChannel &&
+      state.textBlockOpen &&
+      state.textBlockIndex !== null
+    ) {
       const trimmed = state.textAccumulated.trim();
       if (trimmed.length > 0) {
         const safe = ensureCompactionSafeVisibleText(state.textAccumulated);
@@ -749,6 +777,7 @@ export const chunkToMessagesEvents = (
       state.thinkingDeltaEmittedLen = state.thinkingAccumulated.length;
       closeTextBlock(state, out);
     } else if (
+      !state.nativeAssistantChannel &&
       !state.emittedNonemptyTextDelta &&
       state.sealedSignedThinking &&
       state.thinkingAccumulated.length === 0 &&

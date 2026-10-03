@@ -12,6 +12,7 @@ import {
 } from "./anthropic-map";
 import { plainTextFromReasoningItems } from "./reasoning-from-items";
 import {
+  encodeNativeAssistantSignature,
   encodeReasoningSignature,
   reasoningItemsFromUnknown,
 } from "./reasoning-signature";
@@ -69,11 +70,15 @@ export const toAnthropicMessagesResponse = (
   // `signature` so an Anthropic client replays them next turn. Without
   // this a reasoning upstream loses chain-of-thought state every turn
   // and loops forever.
+  const nativeSignature = encodeNativeAssistantSignature(
+    choice?.message.reasoning_items,
+  );
   const reasoningSignature =
     choice !== undefined
-      ? encodeReasoningSignature(
+      ? (nativeSignature ??
+        encodeReasoningSignature(
           reasoningItemsFromUnknown(choice.message.reasoning_items),
-        )
+        ))
       : null;
 
   const content: TAnthropicContentBlock[] = [];
@@ -123,7 +128,9 @@ export const toAnthropicMessagesResponse = (
   const visibleReasoning =
     reasoningSignature === null && reasoning.length > 0 ? reasoning : "";
   const answerText =
-    reasoningSignature !== null && reasoning.length > 0
+    nativeSignature === null &&
+    reasoningSignature !== null &&
+    reasoning.length > 0
       ? visibleAnswerAfterThought(text, reasoning)
       : text;
   if (answerText.length > 0) {
@@ -133,7 +140,8 @@ export const toAnthropicMessagesResponse = (
         : answerText;
     content.push({
       type: "text",
-      text: ensureCompactionSafeVisibleText(body),
+      text:
+        nativeSignature !== null ? body : ensureCompactionSafeVisibleText(body),
     });
   } else if (visibleReasoning.length > 0) {
     content.push({
@@ -158,7 +166,11 @@ export const toAnthropicMessagesResponse = (
   // no summary is the normal shape — the fallback there printed a stray
   // "no visible summary text..." block before every tool call.
   const emittedToolUse = content.some((b) => b.type === "tool_use");
-  if (!content.some((b) => b.type === "text") && !restatedSignedThought) {
+  if (
+    nativeSignature === null &&
+    !content.some((b) => b.type === "text") &&
+    !restatedSignedThought
+  ) {
     if (reasoningSignature !== null) {
       if (reasoning.length === 0 && !emittedToolUse) {
         content.push({

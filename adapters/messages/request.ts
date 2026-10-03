@@ -9,7 +9,10 @@ import type {
 } from "@openllmsh/protocol";
 import type { TCanonicalContentPart } from "../../lib/canonical/content-part";
 import { budgetToReasoningEffort } from "../../providers/anthropic/adaptive-thinking";
-import { decodeReasoningSignature } from "./reasoning-signature";
+import {
+  decodeNativeAssistantSignature,
+  decodeReasoningSignature,
+} from "./reasoning-signature";
 
 const reasonEffortFromThinking = (
   req: TAnthropicRequest,
@@ -470,9 +473,15 @@ const splitAnthropicMessage = (m: TAnthropicMessage): TChatMessage[] => {
   // restarting — and re-issuing the same tool call — every turn.
   // Genuine Anthropic signatures decode to null and are ignored here
   // (that path is the native pass-through, not this adapter).
-  const reasoningItems = thinkingBlocks.flatMap(
-    (b) => decodeReasoningSignature(b.signature) ?? [],
-  );
+  // Native facade carriers are cumulative snapshots. The last signature
+  // supersedes earlier snapshots emitted as native assistant messages arrive.
+  // Responses reasoning items, by contrast, are independent and accumulate.
+  const nativeSnapshots = thinkingBlocks
+    .map((b) => decodeNativeAssistantSignature(b.signature))
+    .filter((items) => items !== null);
+  const reasoningItems =
+    nativeSnapshots.at(-1) ??
+    thinkingBlocks.flatMap((b) => decodeReasoningSignature(b.signature) ?? []);
   const assistantMsg: Extract<TChatMessage, { role: "assistant" }> = {
     role: "assistant",
     content: text,

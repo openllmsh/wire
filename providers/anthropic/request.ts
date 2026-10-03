@@ -245,7 +245,7 @@ const filePartToAnthropicBlock = (
   };
 };
 
-const contentToBlocks = (
+export const contentToAnthropicBlocks = (
   content: TChatMessage["content"] | null | undefined,
 ): TAnthropicContentBlock[] => {
   if (content == null) return [];
@@ -398,7 +398,7 @@ const buildTurnMessages = (
     }
     flushToolResults();
     if (isUser(m)) {
-      const blocks = contentToBlocks(m.content);
+      const blocks = contentToAnthropicBlocks(m.content);
       if (blocks.length === 0) continue;
       applyMessageCacheControl(blocks, readCacheControl(m));
       // Collapse single bare-text block to a plain string for cleaner

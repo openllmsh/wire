@@ -49,6 +49,53 @@ export type TReasoningResponsesInput = {
  * pass-through path) lacks this prefix and is left untouched.
  */
 const SIGNATURE_PREFIX = "openllm-rs1:";
+const NATIVE_ASSISTANT_SIGNATURE_PREFIX = "openllm-cn1:";
+export const CLAUDE_NATIVE_ASSISTANT_CARRIER = "claude_native_assistant";
+export const CLAUDE_NATIVE_ASSISTANT_PENDING =
+  "claude_native_assistant_pending";
+
+/** Native assistant history is NOT Responses ciphertext. Keep its wire
+ * envelope separate; the Claude facade validates model/projection/blocks
+ * before restoring it. This codec only transports the opaque carrier. */
+export const encodeNativeAssistantSignature = (
+  items: ReadonlyArray<unknown> | null | undefined,
+): string | null => {
+  const native = (items ?? []).filter(
+    (item) =>
+      typeof item === "object" &&
+      item !== null &&
+      (item as { type?: unknown }).type === CLAUDE_NATIVE_ASSISTANT_CARRIER,
+  );
+  return native.length > 0
+    ? NATIVE_ASSISTANT_SIGNATURE_PREFIX + toBase64(JSON.stringify(native))
+    : null;
+};
+
+export const decodeNativeAssistantSignature = (
+  signature: string | null | undefined,
+): ReadonlyArray<unknown> | null => {
+  if (
+    typeof signature !== "string" ||
+    !signature.startsWith(NATIVE_ASSISTANT_SIGNATURE_PREFIX)
+  )
+    return null;
+  try {
+    const parsed: unknown = JSON.parse(
+      fromBase64(signature.slice(NATIVE_ASSISTANT_SIGNATURE_PREFIX.length)),
+    );
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    return parsed.every(
+      (item) =>
+        typeof item === "object" &&
+        item !== null &&
+        (item as { type?: unknown }).type === CLAUDE_NATIVE_ASSISTANT_CARRIER,
+    )
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+};
 
 const toBase64 = (s: string): string => {
   if (typeof Buffer !== "undefined") {
