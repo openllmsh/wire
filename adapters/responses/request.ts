@@ -6,6 +6,10 @@ import type {
   TToolCall,
 } from "@openllmsh/protocol";
 import type { TCanonicalContentPart } from "../../lib/canonical/content-part";
+import {
+  canonicalToolNameOf,
+  joinNamespacedToolName,
+} from "../../lib/responses-namespace";
 
 /**
  * Inbound adapter: OpenAI **Responses API** request → canonical
@@ -77,19 +81,41 @@ const contentToText = (content: TResponsesContentPart): string => {
 };
 
 /**
- * Canonical tools — `function` tools ONLY. Codex's non-function built-ins
+ * Canonical tools — `function` tools, plus every function member of a Codex
+ * `namespace` tool (MCP servers, sub-agents) flattened to
+ * `<namespace>--<name>` (`lib/responses-namespace.ts`; the response encoders
+ * split it back). Namespaces arrive top-level or, on Codex ≥0.147, inside a
+ * leading `additional_tools` input item — both are flattened. Codex's non-function built-ins
  * (`custom` apply_patch, `web_search`, `image_generation`, `tool_search`) have
  * no canonical representation, so they're dropped here; they survive for the
  * chatgpt upstream via the verbatim `responses_tools` passthrough instead (see
  * `fromResponsesRequest`). For a cross-wire upstream (anthropic / openai-chat)
  * the non-function tools can't be honoured anyway, so dropping them is correct.
  */
+type TResponsesToolEntry = NonNullable<TResponsesRequest["tools"]>[number];
+
+const isFunctionTool = (t: unknown): t is TResponsesToolEntry =>
+  typeof t === "object" &&
+  t !== null &&
+  (t as { type?: unknown }).type === "function" &&
+  typeof (t as { name?: unknown }).name === "string";
+
+/** Function members of a namespace tool, renamed to the canonical join. */
+const flattenNamespace = (t: TResponsesToolEntry): TResponsesToolEntry[] => {
+  if (t.type !== "namespace" || typeof t.name !== "string") return [];
+  const members = (t as { tools?: unknown }).tools;
+  if (!Array.isArray(members)) return [];
+  const ns = t.name;
+  return members
+    .filter(isFunctionTool)
+    .map((m) => ({ ...m, name: joinNamespacedToolName(ns, m.name as string) }));
+};
+
 const mapTools = (
-  tools: TResponsesRequest["tools"],
+  tools: ReadonlyArray<TResponsesToolEntry>,
 ): TChatCompletionRequest["tools"] => {
-  if (tools == null) return undefined;
-  const fns = tools.filter(
-    (t) => t.type === "function" && typeof t.name === "string",
+  const fns = tools.flatMap((t) =>
+    t.type === "namespace" ? flattenNamespace(t) : isFunctionTool(t) ? [t] : [],
   );
   if (fns.length === 0) return undefined;
   return fns.map((t) => ({
@@ -125,8 +151,8 @@ export const fromResponsesRequest = (
   // Codex v0.147 moves its namespace-scoped harness tools into leading
   // `additional_tools` input items. Keep top-level Responses tools and those
   // leading input items as DISTINCT opaque carriers: their placement changes
-  // the ChatGPT/Codex upstream contract. Only flat top-level functions map to
-  // canonical `tools` for cross-wire providers.
+  // the ChatGPT/Codex upstream contract. Flat top-level functions and the
+  // members of namespace tools (from either place) map to canonical `tools`.
   const responsesTools = req.tools == null ? [] : [...req.tools];
   const responsesAdditionalTools: unknown[] = [];
 
@@ -160,7 +186,10 @@ export const fromResponsesRequest = (
         const toolCall: TToolCall = {
           id: item.call_id,
           type: "function",
-          function: { name: item.name, arguments: item.arguments },
+          function: {
+            name: canonicalToolNameOf(item.name, item.namespace),
+            arguments: item.arguments,
+          },
         };
         messages.push({
           role: "assistant",
@@ -191,7 +220,18 @@ export const fromResponsesRequest = (
     }
   }
 
-  const tools = mapTools(req.tools);
+  const tools = mapTools([
+    ...responsesTools,
+    ...responsesAdditionalTools.flatMap((item) => {
+      const nested = (item as { tools?: unknown }).tools;
+      // Only namespaces: plain harness functions here stay ChatGPT-only.
+      return Array.isArray(nested)
+        ? (nested as TResponsesToolEntry[]).filter(
+            (t) => t.type === "namespace",
+          )
+        : [];
+    }),
+  ]);
   const toolChoice = mapToolChoice(req.tool_choice);
   const effort = mapEffort(req.reasoning);
 

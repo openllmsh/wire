@@ -11,6 +11,7 @@ import {
   reasoningItemToResponsesInput,
 } from "../../adapters/messages/reasoning-signature";
 import { extractMessageText } from "../../lib/canonical/message";
+import { splitNamespacedToolName } from "../../lib/responses-namespace";
 import { effectiveDeny, responsesWirePolicy } from "../upstream-deny";
 
 const CHATGPT_NAME_RE = /^[a-zA-Z0-9_-]+$/;
@@ -154,6 +155,7 @@ type TResponsesInputItem =
       readonly type: "function_call";
       readonly call_id: string;
       readonly name: string;
+      readonly namespace?: string;
       readonly arguments: string;
     }
   | {
@@ -399,10 +401,15 @@ const messagesToInputItems = (
       const toolCalls = msg.tool_calls;
       if (toolCalls !== undefined && toolCalls.length > 0) {
         for (const call of toolCalls) {
+          // A namespace member (canonical `<ns>--<name>`) goes back as the
+          // Responses pair Codex declared it with, verbatim in responses_tools.
+          const split = splitNamespacedToolName(call.function.name);
           items.push({
             type: "function_call",
             call_id: clampCodexCallId(call.id),
-            name: outboundToolName(call.function.name, toolNames),
+            ...(split.namespace === undefined
+              ? { name: outboundToolName(call.function.name, toolNames) }
+              : { namespace: split.namespace, name: split.name }),
             arguments: call.function.arguments,
           });
         }

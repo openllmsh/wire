@@ -5,6 +5,7 @@ import type {
 } from "@openllmsh/protocol";
 import type { TReasoningItem } from "../../adapters/messages/reasoning-signature";
 import { buildReasoningItem } from "../../adapters/messages/reasoning-signature";
+import { canonicalToolNameOf } from "../../lib/responses-namespace";
 import { UpstreamStreamError } from "../../lib/streaming/upstream-error";
 
 // runtime-only: Responses API events arrive as freeform JSON dicts. We
@@ -368,7 +369,14 @@ const toolCallId = (item: Record<string, unknown>): string | undefined =>
   stringField(item, "call_id") ?? stringField(item, "id");
 
 const toolCallName = (item: Record<string, unknown>): string | undefined =>
-  isApplyPatchItem(item) ? "apply_patch" : stringField(item, "name");
+  isApplyPatchItem(item)
+    ? "apply_patch"
+    : (() => {
+        const name = stringField(item, "name");
+        return name === undefined
+          ? undefined
+          : canonicalToolNameOf(name, item.namespace);
+      })();
 
 type TToolCallDelta = NonNullable<
   NonNullable<
@@ -801,6 +809,9 @@ export const chatGptEventToChunk = (
         : {}),
       ...(stringField(event, "name") !== undefined
         ? { name: stringField(event, "name") }
+        : {}),
+      ...(stringField(event, "namespace") !== undefined
+        ? { namespace: stringField(event, "namespace") }
         : {}),
     };
     const identity = takeUnemittedToolIdentity(

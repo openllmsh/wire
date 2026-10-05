@@ -4,6 +4,7 @@ import type {
   TResponsesResponse,
 } from "@openllmsh/protocol";
 import { extractMessageText } from "../../lib/canonical/message";
+import { responsesCallIdentity } from "../../lib/responses-namespace";
 import {
   reasoningItemsFromUnknown,
   reasoningItemToResponsesInput,
@@ -52,7 +53,7 @@ export const toResponsesResponse = (
         type: "function_call",
         id: `fc_${tc.id}`,
         call_id: tc.id,
-        name: tc.function.name,
+        ...responsesCallIdentity(tc.function.name),
         arguments: tc.function.arguments,
         status: "completed",
       });

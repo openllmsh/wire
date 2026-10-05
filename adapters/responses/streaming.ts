@@ -1,4 +1,5 @@
 import type { TChatCompletionChunk } from "@openllmsh/protocol";
+import { responsesCallIdentity } from "../../lib/responses-namespace";
 import { upstreamErrorFrom } from "../../lib/streaming/upstream-error";
 
 /**
@@ -53,7 +54,7 @@ const itemJson = (it: TOutputItem): unknown =>
         type: "function_call",
         id: it.id,
         call_id: it.callId,
-        name: it.name,
+        ...responsesCallIdentity(it.name),
         arguments: it.args,
         status: "completed",
       };
@@ -232,7 +233,7 @@ export const chunksToResponsesSseBytes = (
                     type: "function_call",
                     id: item.id,
                     call_id: item.callId,
-                    name: item.name,
+                    ...responsesCallIdentity(item.name),
                     arguments: "",
                   },
                 }),
