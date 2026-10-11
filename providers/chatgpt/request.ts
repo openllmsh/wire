@@ -445,6 +445,19 @@ const messagesToInputItems = (
  * narrow runtime check keeps an arbitrary canonical caller from injecting a
  * malformed input item while preserving accepted payloads byte-for-byte.
  */
+/**
+ * The vendor's hosted `image_generation` tool is never forwarded. Its result
+ * is an inline base64 image (`image_generation_call.result`) that the client
+ * replays in history on every later turn — multi-MB request bodies that trip
+ * size limits — and the canonical pipeline has no carrier for it, so the
+ * image would be dropped anyway. Image generation goes through the OpenLLM
+ * MCP image tool, which returns a durable URL.
+ */
+const isHostedImageGenerationTool = (tool: unknown): boolean =>
+  tool !== null &&
+  typeof tool === "object" &&
+  (tool as { readonly type?: unknown }).type === "image_generation";
+
 const additionalToolsToInputItems = (
   items: ReadonlyArray<unknown> | undefined,
 ): TResponsesInputItem[] => {
@@ -459,7 +472,11 @@ const additionalToolsToInputItems = (
       (item as { readonly role?: unknown }).role === "developer" &&
       Array.isArray((item as { readonly tools?: unknown }).tools)
     ) {
-      result.push(item as TResponsesInputItem);
+      const tools = (item as { readonly tools: ReadonlyArray<unknown> }).tools;
+      result.push({
+        ...(item as TResponsesInputItem & object),
+        tools: tools.filter((tool) => !isHostedImageGenerationTool(tool)),
+      } as TResponsesInputItem);
     }
   }
   return result;
@@ -649,18 +666,20 @@ const sanitizeResponsesTools = (
   tools: ReadonlyArray<TResponsesPassthroughToolDef>,
   toolNames: ReadonlyMap<string, string>,
 ): ReadonlyArray<TResponsesPassthroughToolDef> =>
-  tools.map((tool) => {
-    if (tool.type !== "function") return tool;
-    return {
-      ...tool,
-      ...(typeof tool.name === "string"
-        ? { name: outboundToolName(tool.name, toolNames) }
-        : {}),
-      ...("parameters" in tool
-        ? { parameters: sanitizeToolParameters(tool.parameters) }
-        : {}),
-    };
-  });
+  tools
+    .filter((tool) => !isHostedImageGenerationTool(tool))
+    .map((tool) => {
+      if (tool.type !== "function") return tool;
+      return {
+        ...tool,
+        ...(typeof tool.name === "string"
+          ? { name: outboundToolName(tool.name, toolNames) }
+          : {}),
+        ...("parameters" in tool
+          ? { parameters: sanitizeToolParameters(tool.parameters) }
+          : {}),
+      };
+    });
 
 // runtime-only: tool_choice in the Responses API. Mirrors the tools
 // shape — FLAT `{type:"function", name}`, NOT the chat-completions
@@ -828,7 +847,8 @@ export const toChatGptRequest = (
   ];
   // Prefer the verbatim `responses_tools` passthrough (Codex's full original
   // tool set, function + non-function) — it round-trips apply_patch /
-  // web_search / image_generation / tool_search intact to the same endpoint
+  // web_search / tool_search intact (hosted image_generation is dropped —
+  // see isHostedImageGenerationTool) to the same endpoint
   // Codex speaks to natively. Fall back to the function-only canonical tools
   // (a cross-wire client, or a non-Codex caller that set `tools`).
   const responsesTools:
