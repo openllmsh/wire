@@ -48,7 +48,7 @@ const safeHeaderValue = (value: string): string => {
  *
  * `originator` + `user-agent` are NOT synthesized — they come from the
  * local daemon, which reads them from the official Codex CLI's own
- * identity (see `packages/daemon/src/delegation/chatgpt.ts`) and passes
+ * identity (see `packages/cli/daemon/src/delegation/chatgpt.ts`) and passes
  * them via `options`. We emit them only when supplied, so the gateway
  * never forges a `codex_cli_rs` fingerprint; the request carries the
  * genuine client's identity.

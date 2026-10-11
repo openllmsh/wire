@@ -3,7 +3,7 @@
  *
  * Codex enables the same capability on its bridge through
  * `thread/start.config.web_search: "live"` (see
- * `packages/daemon/src/native-runtime/codex-web-search.ts`). On the Responses
+ * `packages/cli/daemon/src/native-runtime/codex-web-search.ts`). On the Responses
  * API, that hosted capability is the OpenAI-native `{ type: "web_search" }`
  * tool, whose completed lifecycle is emitted as `web_search_call` and decoded
  * by `./streaming` into canonical `server_search_calls`.

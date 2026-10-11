@@ -2,7 +2,7 @@
 
 > `@openllmsh/wire` — the **wire-format transforms** shared by the cloud
 > proxy pipeline (`packages/core`) and the local subscription daemon
-> (`packages/daemon`). Depends on `@openllmsh/protocol` and `effect`'s
+> (`packages/cli/daemon`). Depends on `@openllmsh/protocol` and `effect`'s
 > `Schema` decoder only: **no Effect-DI, no provider registry, no `fetch`, no
 > HTTP framework, no DB.** It provides pure request/response transforms and
 > self-contained stream transforms over protocol wire types.
