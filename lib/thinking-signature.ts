@@ -108,9 +108,7 @@ const isActiveToolUseContinuation = (
   const curContent = messageContent(cur);
   const nextContent = messageContent(next);
   if (curContent === null || nextContent === null) return false;
-  return (
-    curContent.some(isToolUseBlock) && nextContent.some(isToolResultBlock)
-  );
+  return curContent.some(isToolUseBlock) && nextContent.some(isToolResultBlock);
 };
 
 /** True when a built Anthropic Messages body carries at least one assistant
