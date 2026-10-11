@@ -64,7 +64,16 @@ const reasonForStatus = (i: TClassifierInput): TCooldownReason => {
   if (i.status >= 500) {
     return isEnvoyConnectError(message) ? "network" : "server_error";
   }
-  if (i.status === 401 || i.status === 403 || i.status === 407) {
+  // 426 Upgrade Required: the upstream refuses THIS client (xAI's CLI proxy
+  // gates on the device's installed grok version). Like an auth failure it is
+  // hop-local — another provider/device can serve — so it cools and advances
+  // instead of falling into `upstream_rejection` (surface), which halted the chain.
+  if (
+    i.status === 401 ||
+    i.status === 403 ||
+    i.status === 407 ||
+    i.status === 426
+  ) {
     return QUOTA_BODY.test(message) ? "quota_exhausted" : "auth";
   }
   if (i.status === 402) {
