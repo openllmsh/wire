@@ -20,8 +20,6 @@
 
 export const COUNT_TOKENS_CAPABILITY_LIMIT = 256;
 
-const unsupported = new Map<string, true>();
-
 export type TCountTokensCapabilityScope = {
   readonly provider: string;
   readonly endpointIdentity: string;
@@ -42,35 +40,59 @@ export const countTokensEndpointIdentity = (countUrl: string): string => {
   }
 };
 
-const scopeKey = (scope: TCountTokensCapabilityScope): string =>
-  `${scope.provider}\0${scope.endpointIdentity}`;
+export type TCountTokensCapabilityMemory = {
+  readonly isUnsupported: (scope: TCountTokensCapabilityScope) => boolean;
+  readonly remember: (scope: TCountTokensCapabilityScope) => void;
+};
+
+/**
+ * Build a capability memory with its own LRU. Production uses the module
+ * default via {@link isCountTokensUnsupported} /
+ * {@link rememberCountTokensUnsupported}; tests build a fresh one per case.
+ */
+export const createCountTokensCapabilityMemory = (
+  limit: number = COUNT_TOKENS_CAPABILITY_LIMIT,
+): TCountTokensCapabilityMemory => {
+  const unsupported = new Map<string, true>();
+  const scopeKey = (scope: TCountTokensCapabilityScope): string =>
+    `${scope.provider}\0${scope.endpointIdentity}`;
+
+  return {
+    isUnsupported(scope) {
+      if (scope.endpointIdentity.length === 0) return false;
+      const k = scopeKey(scope);
+      if (!unsupported.has(k)) return false;
+      unsupported.delete(k);
+      unsupported.set(k, true);
+      return true;
+    },
+    remember(scope) {
+      if (scope.endpointIdentity.length === 0) return;
+      const k = scopeKey(scope);
+      if (unsupported.has(k)) {
+        unsupported.delete(k);
+        unsupported.set(k, true);
+        return;
+      }
+      if (unsupported.size >= limit) {
+        const oldest = unsupported.keys().next().value;
+        if (oldest !== undefined) unsupported.delete(oldest);
+      }
+      unsupported.set(k, true);
+    },
+  };
+};
+
+const defaultMemory = createCountTokensCapabilityMemory();
 
 export const isCountTokensUnsupported = (
   scope: TCountTokensCapabilityScope,
-): boolean => {
-  if (scope.endpointIdentity.length === 0) return false;
-  const k = scopeKey(scope);
-  if (!unsupported.has(k)) return false;
-  unsupported.delete(k);
-  unsupported.set(k, true);
-  return true;
-};
+): boolean => defaultMemory.isUnsupported(scope);
 
 export const rememberCountTokensUnsupported = (
   scope: TCountTokensCapabilityScope,
 ): void => {
-  if (scope.endpointIdentity.length === 0) return;
-  const k = scopeKey(scope);
-  if (unsupported.has(k)) {
-    unsupported.delete(k);
-    unsupported.set(k, true);
-    return;
-  }
-  if (unsupported.size >= COUNT_TOKENS_CAPABILITY_LIMIT) {
-    const oldest = unsupported.keys().next().value;
-    if (oldest !== undefined) unsupported.delete(oldest);
-  }
-  unsupported.set(k, true);
+  defaultMemory.remember(scope);
 };
 
 const modelMissing = (t: string): boolean =>
@@ -113,9 +135,4 @@ export const countTokensUnsupportedFromUpstream = (
   const t = bodyText.toLowerCase();
   if (modelMissing(t)) return false;
   return countRouteMissing(t);
-};
-
-/** TEST-ONLY: drop remembered unsupported endpoints. */
-export const __resetCountTokensCapabilityForTest = (): void => {
-  unsupported.clear();
 };

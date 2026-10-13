@@ -17,11 +17,10 @@ import type { BpeCounter } from "./bpe-core";
  */
 export type TRulerFamily = "claude" | "o200k";
 
-const counters = new Map<TRulerFamily, BpeCounter>();
-const loading = new Map<TRulerFamily, Promise<BpeCounter>>();
-// Bumped by __resetRulersForTest so a build() that was in flight at reset time
-// can't repopulate the just-cleared cache (test-only race).
-let cacheGeneration = 0;
+export type TRulerCache = {
+  readonly get: (family: TRulerFamily) => Promise<BpeCounter>;
+  readonly peek: (family: TRulerFamily) => BpeCounter | null;
+};
 
 const build = async (family: TRulerFamily): Promise<BpeCounter> => {
   const { BpeCounter: Counter } = await import("./bpe-core");
@@ -33,40 +32,48 @@ const build = async (family: TRulerFamily): Promise<BpeCounter> => {
 };
 
 /**
+ * Build a per-family ruler cache. Production uses the module default via
+ * {@link getRuler} / {@link peekRuler}; tests that need a cold cache build
+ * their own.
+ */
+export const createRulerCache = (): TRulerCache => {
+  const counters = new Map<TRulerFamily, BpeCounter>();
+  const loading = new Map<TRulerFamily, Promise<BpeCounter>>();
+
+  return {
+    get(family) {
+      const cached = counters.get(family);
+      if (cached !== undefined) return Promise.resolve(cached);
+      const inflight = loading.get(family);
+      if (inflight !== undefined) return inflight;
+      const p = build(family)
+        .then((counter) => {
+          counters.set(family, counter);
+          return counter;
+        })
+        .finally(() => {
+          if (loading.get(family) === p) loading.delete(family);
+        });
+      loading.set(family, p);
+      return p;
+    },
+    peek(family) {
+      return counters.get(family) ?? null;
+    },
+  };
+};
+
+const defaultRulerCache = createRulerCache();
+
+/**
  * Resolve (and cache) the counter for a family, building it on first use. The
  * in-flight promise dedupes concurrent first-calls; the `loading` entry is
  * cleared on both fulfilment and rejection so a transient import failure can be
  * retried rather than caching a rejected promise forever.
  */
-export const getRuler = (family: TRulerFamily): Promise<BpeCounter> => {
-  const cached = counters.get(family);
-  if (cached !== undefined) return Promise.resolve(cached);
-  const inflight = loading.get(family);
-  if (inflight !== undefined) return inflight;
-  const generation = cacheGeneration;
-  const p = build(family)
-    .then((counter) => {
-      // Only cache if no reset happened while this build was in flight —
-      // otherwise we'd repopulate a just-cleared family with a stale counter.
-      if (generation === cacheGeneration) counters.set(family, counter);
-      return counter;
-    })
-    .finally(() => {
-      // Only clear OUR own loading entry: a post-reset getRuler may have
-      // installed a newer in-flight promise we must not delete.
-      if (loading.get(family) === p) loading.delete(family);
-    });
-  loading.set(family, p);
-  return p;
-};
+export const getRuler = (family: TRulerFamily): Promise<BpeCounter> =>
+  defaultRulerCache.get(family);
 
 /** Synchronously return an already-built counter, or `null` if not warmed. */
 export const peekRuler = (family: TRulerFamily): BpeCounter | null =>
-  counters.get(family) ?? null;
-
-/** TEST-ONLY: drop the per-isolate counter cache. */
-export const __resetRulersForTest = (): void => {
-  cacheGeneration++;
-  counters.clear();
-  loading.clear();
-};
+  defaultRulerCache.peek(family);

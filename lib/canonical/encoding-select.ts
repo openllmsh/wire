@@ -15,8 +15,8 @@
  * adapter over that core; the heavy vocab is imported lazily inside the ruler,
  * so an estimate that never runs never pays the parse cost.
  */
-import type { TRulerFamily } from "../token-ruler";
-import { __resetRulersForTest, getRuler, peekRuler } from "../token-ruler";
+import type { TRulerCache, TRulerFamily } from "../token-ruler";
+import { createRulerCache, getRuler, peekRuler } from "../token-ruler";
 
 /**
  * The coarse tokenizer families we select between. NOT provider ids — several
@@ -53,15 +53,20 @@ export type TTokenCounter = {
   readonly count: (text: string) => number;
 };
 
+export type { TRulerCache };
+export { createRulerCache };
+
 /**
  * Resolve (and cache) the counter for a family. Async because the vocab data is
  * imported lazily — the first call per family builds a ~65k–200k-entry lookup;
  * every call after is a cache hit. Concurrent first-calls are deduped inside the
- * ruler.
+ * ruler. Pass a {@link TRulerCache} to use a non-default cache (tests).
  */
 export const getTokenCounter = (
   encoding: TTokenEncoding,
-): Promise<TTokenCounter> => getRuler(encoding);
+  cache?: TRulerCache,
+): Promise<TTokenCounter> =>
+  (cache ?? { get: getRuler, peek: peekRuler }).get(encoding);
 
 /**
  * Synchronously return an already-loaded counter, or `null` if the family
@@ -72,14 +77,6 @@ export const getTokenCounter = (
  */
 export const peekTokenCounter = (
   encoding: TTokenEncoding,
-): TTokenCounter | null => peekRuler(encoding);
-
-/**
- * TEST-ONLY: drop the per-isolate warm-counter cache so the estimators fall back
- * to `chars/4` again. The counter cache is module-global (in the ruler), so a
- * test that warms a family (via {@link getTokenCounter}) would otherwise leak
- * the warm ruler into every later suite in the same process. Call in `afterAll`.
- */
-export const __resetTokenCountersForTest = (): void => {
-  __resetRulersForTest();
-};
+  cache?: TRulerCache,
+): TTokenCounter | null =>
+  (cache ?? { get: getRuler, peek: peekRuler }).peek(encoding);
