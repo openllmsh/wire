@@ -177,15 +177,20 @@ const ropeSetRest = (rope: TStringRope, rest: string): void => {
 /** True when the latest piece may have completed an SSE frame (blank line). */
 const pieceMayCompleteFrame = (piece: string): boolean => {
   if (piece.length === 0) return false;
-  // Blank-line terminators: \n\n, \r\n\r\n, \r\r, and mixed. A lone \n at
-  // the end of a piece is enough to bother joining — the previous piece
-  // may have ended with \n.
+  // Blank-line terminators: \n\n, \r\n\r\n, \r\r, and mixed. A lone
+  // terminator at either end is enough to bother joining — the previous
+  // rest may have ended with `\n`/`\r` and this piece starts with the
+  // matching half of the blank-line boundary.
+  const first = piece.charCodeAt(0);
+  const last = piece.charCodeAt(piece.length - 1);
   return (
+    first === 10 /* \n */ ||
+    first === 13 /* \r */ ||
+    last === 10 ||
+    last === 13 ||
     piece.includes("\n\n") ||
     piece.includes("\r\n\r\n") ||
-    piece.includes("\r\r") ||
-    piece.endsWith("\n") ||
-    piece.endsWith("\r")
+    piece.includes("\r\r")
   );
 };
 

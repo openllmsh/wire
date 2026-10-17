@@ -169,32 +169,14 @@ export const newMessagesStreamState = (): TMessagesStreamState => ({
  * and is skipped in both modes.
  */
 /**
- * Snapshot-mode prefix check without O(n) `startsWith` on every growing
- * event. Responses-style channels re-send the full prefix; once the shared
- * region is long, a boundary fingerprint (head + tail windows) validates
- * the common monotone-extension case in O(1). Divergent fingerprints fall
- * back to a full `startsWith` so non-prefix replacements stay correct.
+ * Snapshot-mode prefix check. Responses-style channels re-send the full
+ * prefix; only a true `startsWith` is correct — a head/tail fingerprint
+ * falsely treats mid-text revisions that share both boundaries as
+ * extensions. Snapshot frames are infrequent enough that O(n) is fine.
  */
-const SNAPSHOT_FINGERPRINT_CHARS = 16;
-
 const snapshotExtends = (incoming: string, accumulated: string): boolean => {
-  const accLen = accumulated.length;
-  if (accLen === 0) return true;
-  if (incoming.length < accLen) return false;
-  // Short prefixes: a full startsWith is cheap and exact.
-  if (accLen <= SNAPSHOT_FINGERPRINT_CHARS * 2) {
-    return incoming.startsWith(accumulated);
-  }
-  const w = SNAPSHOT_FINGERPRINT_CHARS;
-  // O(1) boundary fingerprint for the common Responses monotone-growth
-  // path. Head + tail windows catch the non-prefix replacements the
-  // suite cares about; a mismatch falls back to startsWith.
-  if (
-    incoming.slice(0, w) === accumulated.slice(0, w) &&
-    incoming.slice(accLen - w, accLen) === accumulated.slice(accLen - w)
-  ) {
-    return true;
-  }
+  if (accumulated.length === 0) return true;
+  if (incoming.length < accumulated.length) return false;
   return incoming.startsWith(accumulated);
 };
 
