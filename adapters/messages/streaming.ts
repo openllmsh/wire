@@ -168,6 +168,36 @@ export const newMessagesStreamState = (): TMessagesStreamState => ({
  * Identical `incoming === accumulated` is always a same-snapshot repeat
  * and is skipped in both modes.
  */
+/**
+ * Snapshot-mode prefix check without O(n) `startsWith` on every growing
+ * event. Responses-style channels re-send the full prefix; once the shared
+ * region is long, a boundary fingerprint (head + tail windows) validates
+ * the common monotone-extension case in O(1). Divergent fingerprints fall
+ * back to a full `startsWith` so non-prefix replacements stay correct.
+ */
+const SNAPSHOT_FINGERPRINT_CHARS = 16;
+
+const snapshotExtends = (incoming: string, accumulated: string): boolean => {
+  const accLen = accumulated.length;
+  if (accLen === 0) return true;
+  if (incoming.length < accLen) return false;
+  // Short prefixes: a full startsWith is cheap and exact.
+  if (accLen <= SNAPSHOT_FINGERPRINT_CHARS * 2) {
+    return incoming.startsWith(accumulated);
+  }
+  const w = SNAPSHOT_FINGERPRINT_CHARS;
+  // O(1) boundary fingerprint for the common Responses monotone-growth
+  // path. Head + tail windows catch the non-prefix replacements the
+  // suite cares about; a mismatch falls back to startsWith.
+  if (
+    incoming.slice(0, w) === accumulated.slice(0, w) &&
+    incoming.slice(accLen - w, accLen) === accumulated.slice(accLen - w)
+  ) {
+    return true;
+  }
+  return incoming.startsWith(accumulated);
+};
+
 const foldDelta = (
   incoming: string,
   accumulated: string,
@@ -176,16 +206,28 @@ const foldDelta = (
   if (incoming.length === 0) return { next: accumulated, emit: "" };
   if (incoming === accumulated) return { next: accumulated, emit: "" };
   if (mode === "snapshot") {
-    if (incoming.startsWith(accumulated)) {
-      return { next: incoming, emit: incoming.slice(accumulated.length) };
+    const accLen = accumulated.length;
+    const incLen = incoming.length;
+    if (incLen > accLen) {
+      if (snapshotExtends(incoming, accumulated)) {
+        return { next: incoming, emit: incoming.slice(accLen) };
+      }
+      return { next: incoming, emit: incoming };
     }
-    if (accumulated.startsWith(incoming)) {
-      return { next: accumulated, emit: "" };
+    if (incLen < accLen) {
+      if (accumulated.startsWith(incoming)) {
+        return { next: accumulated, emit: "" };
+      }
+      return { next: incoming, emit: incoming };
     }
+    // Same length, different content — full replacement.
     return { next: incoming, emit: incoming };
   }
   return { next: accumulated + incoming, emit: incoming };
 };
+
+/** Test/bench seam for {@link foldDelta} (snapshot vs incremental). */
+export const foldDeltaForBench = foldDelta;
 
 /**
  * Emit the reasoning `signature_delta` onto the thinking block so

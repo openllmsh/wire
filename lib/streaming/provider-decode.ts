@@ -64,6 +64,21 @@ export const decodeProviderEventStream = <TEvent, TState, TOpts>(
   const decode = Schema.decodeUnknownSync(spec.eventSchema);
   const reader = events.getReader();
   let settled = false;
+  // After the first Schema-validated event, delta frames reuse JSON.parse
+  // only (unchecked). Terminal / non-delta frames keep the Schema path.
+  let schemaWarmed = false;
+
+  const isLikelyDeltaFrame = (value: unknown): boolean => {
+    if (value === null || typeof value !== "object") return false;
+    const record = value as Record<string, unknown>;
+    if (record.type === "content_block_delta") return true;
+    // OpenAI chunks need Schema when `choices` is absent — DashScope (and
+    // others) omit it on the trailing usage frame; Schema defaults `choices`
+    // to `[]`. Fast-path only when the key is already present.
+    return (
+      record.object === "chat.completion.chunk" && Array.isArray(record.choices)
+    );
+  };
 
   const initiateCancel = (reason?: unknown): void => {
     void reader.cancel(reason).catch(() => {});
@@ -113,7 +128,12 @@ export const decodeProviderEventStream = <TEvent, TState, TOpts>(
           }
           let event: TEvent;
           try {
-            event = decode(parsedJson);
+            if (schemaWarmed && isLikelyDeltaFrame(parsedJson)) {
+              event = parsedJson as TEvent;
+            } else {
+              event = decode(parsedJson);
+              schemaWarmed = true;
+            }
           } catch (firstErr) {
             let recovered: TEvent | null = null;
             if (

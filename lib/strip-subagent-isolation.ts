@@ -2,7 +2,6 @@ import type {
   TChatCompletionChunk,
   TChatCompletionResponse,
 } from "@openllmsh/protocol";
-import { accumulateChunksToResponse } from "./streaming/accumulate";
 
 const SUBAGENT_TOOL_NAMES = new Set<string>(["Agent", "Task"]);
 
@@ -75,59 +74,62 @@ export const stripIsolationFromResponse = (
   return changed ? { ...response, choices } : response;
 };
 
-const chunksFrom = (
-  chunks: ReadonlyArray<TChatCompletionChunk>,
-): ReadableStream<TChatCompletionChunk> =>
-  new ReadableStream<TChatCompletionChunk>({
-    start(controller) {
-      for (const chunk of chunks) controller.enqueue(chunk);
-      controller.close();
-    },
-  });
-
 type TTargetToolCall = {
   readonly index: number;
   readonly arguments: string;
 };
 
-const targetToolCallsFrom = async (
+/**
+ * Cheap path: concatenate choice-0 tool-call argument deltas directly.
+ * Avoids `accumulateChunksToResponse` (full chat-completion rebuild) when
+ * every target name is visible on the wire and args are plain string joins.
+ */
+const targetToolCallsFromDeltas = (
   chunks: ReadonlyArray<TChatCompletionChunk>,
-): Promise<ReadonlyArray<TTargetToolCall>> => {
-  const response = await accumulateChunksToResponse(
-    chunksFrom(chunks),
-    chunks[0]?.model ?? "unknown",
-  );
-  const toolCalls = response.choices[0]?.message.tool_calls ?? [];
-  // The shared accumulator reconstructs only choice 0, so targets are
-  // scoped to choice 0. Tool-call `index` is per-choice in the OpenAI
-  // wire, so a secondary choice (`n > 1`) can reuse index 0 for an
-  // unrelated call — gathering indices across choices would strip those
-  // too. Collect streamed indices from choice 0 alone.
-  const streamedIndices = new Set<number>();
+): ReadonlyArray<TTargetToolCall> => {
+  type TAcc = {
+    name: string;
+    arguments: string;
+  };
+  const byIndex = new Map<number, TAcc>();
   for (const chunk of chunks) {
     for (const choice of chunk.choices) {
       if (choice.index !== TARGET_CHOICE_INDEX) continue;
       for (const toolCall of choice.delta.tool_calls ?? []) {
-        streamedIndices.add(toolCall.index);
+        const existing = byIndex.get(toolCall.index);
+        const nameDelta = toolCall.function?.name ?? undefined;
+        const argsDelta = toolCall.function?.arguments ?? undefined;
+        if (existing === undefined) {
+          byIndex.set(toolCall.index, {
+            name: nameDelta ?? "",
+            arguments: argsDelta ?? "",
+          });
+        } else {
+          if (nameDelta !== undefined && nameDelta.length > 0) {
+            existing.name = nameDelta;
+          }
+          if (argsDelta !== undefined) {
+            existing.arguments += argsDelta;
+          }
+        }
       }
     }
   }
-  const orderedIndices = [...streamedIndices].sort((a, b) => a - b);
-  return toolCalls.flatMap((toolCall, index) => {
-    if (!SUBAGENT_TOOL_NAMES.has(toolCall.function.name)) return [];
-    const argumentsJson = stripIsolationArguments(toolCall.function.arguments);
-    // No streamed choice-0 index for this accumulator position means the
-    // accumulator folded in a secondary choice (`n > 1`). Guessing an index
-    // could collide with a real choice-0 call and re-emit the wrong payload,
-    // so leave the tail byte-for-byte — the documented fallback for every
-    // other unhandled shape.
-    const streamedIndex = orderedIndices[index];
-    if (streamedIndex === undefined) return [];
-    return argumentsJson === toolCall.function.arguments
-      ? []
-      : [{ index: streamedIndex, arguments: argumentsJson }];
-  });
+  if (byIndex.size === 0) return [];
+  const out: TTargetToolCall[] = [];
+  const ordered = [...byIndex.entries()].sort((a, b) => a[0] - b[0]);
+  for (const [index, acc] of ordered) {
+    if (!SUBAGENT_TOOL_NAMES.has(acc.name)) continue;
+    const argumentsJson = stripIsolationArguments(acc.arguments);
+    if (argumentsJson === acc.arguments) continue;
+    out.push({ index, arguments: argumentsJson });
+  }
+  return out;
 };
+
+const targetToolCallsFrom = (
+  chunks: ReadonlyArray<TChatCompletionChunk>,
+): ReadonlyArray<TTargetToolCall> => targetToolCallsFromDeltas(chunks);
 
 const withoutTargetArguments = (
   chunk: TChatCompletionChunk,
@@ -213,7 +215,7 @@ const rebuildToolCallTail = async (
     if (done) break;
     buffered.push(value);
   }
-  const targetToolCalls = await targetToolCallsFrom(buffered);
+  const targetToolCalls = targetToolCallsFrom(buffered);
   const template = buffered[0];
   if (targetToolCalls.length === 0 || template === undefined) {
     return buffered;

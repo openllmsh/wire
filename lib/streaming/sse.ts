@@ -141,18 +141,67 @@ const parseEvent = (raw: string): TSseEvent | null => {
   return null;
 };
 
+/**
+ * Rope of decoded string chunks. Avoids `buffer += chunk` (O(n) copy per
+ * tiny TCP read) by keeping parts until a frame boundary forces a join.
+ */
+type TStringRope = {
+  parts: string[];
+  length: number;
+};
+
+const emptyRope = (): TStringRope => ({ parts: [], length: 0 });
+
+const ropePush = (rope: TStringRope, piece: string): void => {
+  if (piece.length === 0) return;
+  rope.parts.push(piece);
+  rope.length += piece.length;
+};
+
+const ropeJoin = (rope: TStringRope): string => {
+  if (rope.parts.length === 0) return "";
+  if (rope.parts.length === 1) return rope.parts[0] ?? "";
+  return rope.parts.join("");
+};
+
+const ropeSetRest = (rope: TStringRope, rest: string): void => {
+  if (rest.length === 0) {
+    rope.parts = [];
+    rope.length = 0;
+    return;
+  }
+  rope.parts = [rest];
+  rope.length = rest.length;
+};
+
+/** True when the latest piece may have completed an SSE frame (blank line). */
+const pieceMayCompleteFrame = (piece: string): boolean => {
+  if (piece.length === 0) return false;
+  // Blank-line terminators: \n\n, \r\n\r\n, \r\r, and mixed. A lone \n at
+  // the end of a piece is enough to bother joining — the previous piece
+  // may have ended with \n.
+  return (
+    piece.includes("\n\n") ||
+    piece.includes("\r\n\r\n") ||
+    piece.includes("\r\r") ||
+    piece.endsWith("\n") ||
+    piece.endsWith("\r")
+  );
+};
+
 export const sseEventStream = (
   source: ReadableStream<Uint8Array>,
 ): ReadableStream<TSseEvent> => {
   const reader = source.getReader();
   const decoder = new TextDecoder();
-  let buffer = "";
+  const rope = emptyRope();
   return new ReadableStream<TSseEvent>({
     async pull(controller) {
       for (;;) {
         const { value, done } = await reader.read();
         if (done) {
-          buffer += decoder.decode();
+          ropePush(rope, decoder.decode());
+          const buffer = ropeJoin(rope);
           const { frames, rest } = splitFrames(buffer);
           for (const frame of frames) {
             const parsed = parseEvent(frame.content);
@@ -160,12 +209,19 @@ export const sseEventStream = (
           }
           const trailing = parseEvent(rest);
           if (trailing) controller.enqueue(trailing);
+          ropeSetRest(rope, "");
           controller.close();
           return;
         }
-        buffer += decoder.decode(value, { stream: true });
+        const piece = decoder.decode(value, { stream: true });
+        ropePush(rope, piece);
+        // Skip the join+scan while the new bytes cannot complete a frame.
+        if (rope.parts.length > 1 && !pieceMayCompleteFrame(piece)) {
+          continue;
+        }
+        const buffer = ropeJoin(rope);
         const { frames, rest } = splitFrames(buffer);
-        buffer = rest;
+        ropeSetRest(rope, rest);
         if (frames.length === 0) continue;
         for (const frame of frames) {
           const parsed = parseEvent(frame.content);
@@ -298,7 +354,7 @@ export const withFrameAlignedHeartbeat = (
   let timer: ReturnType<typeof setInterval> | null = null;
   let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
   let closed = false;
-  let buffer = "";
+  const rope = emptyRope();
 
   const beat =
     options.kind === "anthropic_ping"
@@ -336,7 +392,8 @@ export const withFrameAlignedHeartbeat = (
           if (done) {
             // Flush decoder state, then any unterminated trailing bytes
             // verbatim so an upstream that ends mid-frame loses nothing.
-            buffer += decoder.decode();
+            ropePush(rope, decoder.decode());
+            const buffer = ropeJoin(rope);
             const flushed = splitFrames(buffer);
             for (const frame of flushed.frames) {
               controller.enqueue(textEncoder.encode(frame.raw));
@@ -344,15 +401,20 @@ export const withFrameAlignedHeartbeat = (
             if (flushed.rest.length > 0) {
               controller.enqueue(textEncoder.encode(flushed.rest));
             }
-            buffer = "";
+            ropeSetRest(rope, "");
             closed = true;
             clear();
             controller.close();
             return;
           }
-          buffer += decoder.decode(value, { stream: true });
+          const piece = decoder.decode(value, { stream: true });
+          ropePush(rope, piece);
+          if (rope.parts.length > 1 && !pieceMayCompleteFrame(piece)) {
+            continue;
+          }
+          const buffer = ropeJoin(rope);
           const { frames, rest } = splitFrames(buffer);
-          buffer = rest;
+          ropeSetRest(rope, rest);
           if (frames.length === 0) continue;
           for (const frame of frames) {
             controller.enqueue(textEncoder.encode(frame.raw));
