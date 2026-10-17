@@ -127,8 +127,10 @@ export const decodeProviderEventStream = <TEvent, TState, TOpts>(
             continue;
           }
           let event: TEvent;
+          let usedFastPath = false;
           try {
-            if (schemaWarmed && isLikelyDeltaFrame(parsedJson)) {
+            usedFastPath = schemaWarmed && isLikelyDeltaFrame(parsedJson);
+            if (usedFastPath) {
               event = parsedJson as TEvent;
             } else {
               event = decode(parsedJson);
@@ -165,8 +167,24 @@ export const decodeProviderEventStream = <TEvent, TState, TOpts>(
           try {
             chunk = spec.eventToChunk(event, state, options);
           } catch (err) {
-            settleError(controller, err);
-            return;
+            // Fast-path skipped Schema; a malformed delta can throw in
+            // eventToChunk. Fall back to Schema decode (drop if that fails)
+            // so one bad frame cannot error the whole stream.
+            if (!usedFastPath) {
+              settleError(controller, err);
+              return;
+            }
+            try {
+              event = decode(parsedJson);
+            } catch {
+              continue;
+            }
+            try {
+              chunk = spec.eventToChunk(event, state, options);
+            } catch (fallbackErr) {
+              settleError(controller, fallbackErr);
+              return;
+            }
           }
           const terminal = spec.isTerminalEvent?.(event) === true;
           if (chunk !== null && !settled) {

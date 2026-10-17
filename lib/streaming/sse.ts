@@ -189,6 +189,9 @@ const pieceMayCompleteFrame = (piece: string): boolean => {
     last === 10 ||
     last === 13 ||
     piece.includes("\n\n") ||
+    // Mixed endings: LF line + CR blank (`\n\r` / `\n\r\n`) interior to the
+    // piece — first/last checks miss these when the piece is padded.
+    piece.includes("\n\r") ||
     piece.includes("\r\n\r\n") ||
     piece.includes("\r\r")
   );
