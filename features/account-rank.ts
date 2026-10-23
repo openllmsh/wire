@@ -117,3 +117,50 @@ export const rankProviderAccounts = (params: {
     ? ordered
     : [pinned, ...ordered.filter((a) => a !== pinned)];
 };
+
+/**
+ * Never-drop-all pick when every signed-in account is cooled or exhausted on
+ * the FINAL hop: still dial one account so the caller gets a real upstream
+ * error instead of a synthetic "all cooled" envelope.
+ *
+ * Deterministic order:
+ *   1. the pinned account, when it is among the signed-in set;
+ *   2. else the signed-in account with the most remaining *trusted* quota
+ *      (ties by lowest index);
+ *   3. else the lowest index.
+ */
+export const pickFinalFallback = (params: {
+  readonly accounts: readonly TRankableAccount[];
+  readonly meter: TSubscriptionMeterMatch | undefined;
+  readonly pinnedIndex: number | null;
+  readonly staleCapMs: number;
+  readonly now: number;
+}): number | undefined => {
+  if (params.accounts.length === 0) return undefined;
+  if (
+    params.pinnedIndex !== null &&
+    params.accounts.some((a) => a.index === params.pinnedIndex)
+  ) {
+    return params.pinnedIndex;
+  }
+  let best: { readonly index: number; readonly remaining: number } | null =
+    null;
+  for (const account of params.accounts) {
+    const quota = trustedQuota(account.snapshot, params.staleCapMs, params.now);
+    if (quota === null) continue;
+    const remaining = remainingQuotaPercent(quota, params.meter);
+    if (
+      best === null ||
+      remaining > best.remaining ||
+      (remaining === best.remaining && account.index < best.index)
+    ) {
+      best = { index: account.index, remaining };
+    }
+  }
+  if (best !== null) return best.index;
+  let lowest = params.accounts[0]?.index;
+  for (const account of params.accounts) {
+    if (lowest === undefined || account.index < lowest) lowest = account.index;
+  }
+  return lowest;
+};
