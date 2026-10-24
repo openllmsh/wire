@@ -12,7 +12,7 @@
  * + the wire SSE primitives.
  */
 import type { TChatCompletionChunk } from "@openllmsh/protocol";
-import { Schema } from "effect";
+import { Effect, Schema } from "effect";
 import { encodeSseDone, encodeSseEvent, sseEventStream } from "./sse";
 import { upstreamErrorFrom } from "./upstream-error";
 
@@ -61,7 +61,14 @@ export const decodeProviderEventStream = <TEvent, TState, TOpts>(
 ): ReadableStream<TChatCompletionChunk> => {
   const state = spec.initialState(options);
   const events = sseEventStream(raw);
-  const decode = Schema.decodeUnknownSync(spec.eventSchema);
+  const decode = (input: unknown): TEvent =>
+    Effect.runSync(
+      Schema.decodeUnknownEffect(spec.eventSchema)(input) as Effect.Effect<
+        TEvent,
+        Schema.SchemaError,
+        never
+      >,
+    );
   const reader = events.getReader();
   let settled = false;
   // After the first Schema-validated event, delta frames reuse JSON.parse
