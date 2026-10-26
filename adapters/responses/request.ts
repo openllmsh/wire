@@ -192,22 +192,28 @@ const narrowNamespace = (
  *  - the hosted `apply_patch` tool becomes its function stand-in, which every
  *    upstream can call (`lib/responses-apply-patch.ts`).
  */
+/** Tools left callable by `tool_choice: allowed_tools` (all of them otherwise). */
+const narrowToAllowed = (
+  tools: ReadonlyArray<TResponsesToolEntry>,
+  choice: TResponsesRequest["tool_choice"],
+): TResponsesToolEntry[] =>
+  choice != null &&
+  typeof choice !== "string" &&
+  choice.type === "allowed_tools"
+    ? tools.flatMap((t) =>
+        t.type === "namespace"
+          ? narrowNamespace(t, choice.tools)
+          : isAllowedTool(t, choice.tools)
+            ? [t]
+            : [],
+      )
+    : [...tools];
+
 const normalizeTools = (
   tools: ReadonlyArray<TResponsesToolEntry>,
   choice: TResponsesRequest["tool_choice"],
 ): TResponsesToolEntry[] => {
-  const narrowed =
-    choice != null &&
-    typeof choice !== "string" &&
-    choice.type === "allowed_tools"
-      ? tools.flatMap((t) =>
-          t.type === "namespace"
-            ? narrowNamespace(t, choice.tools)
-            : isAllowedTool(t, choice.tools)
-              ? [t]
-              : [],
-        )
-      : tools;
+  const narrowed = narrowToAllowed(tools, choice);
   return narrowed.map((t) =>
     isHostedApplyPatchTool(t) ? applyPatchFunctionTool : t,
   );
@@ -267,8 +273,17 @@ export const fromResponsesRequest = (
       } else if (item.type === "additional_tools") {
         // Preserve the entire input item rather than hoisting its nested tools.
         // The Codex upstream distinguishes harness declarations in input from
-        // model-facing tools at the top level.
-        responsesAdditionalTools.push(item);
+        // model-facing tools at the top level. `allowed_tools` narrows it too,
+        // so an excluded harness tool doesn't stay callable through it.
+        const tools = narrowToAllowed(item.tools, req.tool_choice);
+        if (tools.length > 0) {
+          responsesAdditionalTools.push(
+            tools.length === item.tools.length &&
+              tools.every((t, i) => t === item.tools[i])
+              ? item
+              : { ...item, tools },
+          );
+        }
       } else if (item.type === "function_call") {
         const toolCall: TToolCall = {
           id: item.call_id,
