@@ -19,7 +19,7 @@ export const applyPatchFunctionTool = {
   type: "function",
   name: APPLY_PATCH_FUNCTION_NAME,
   description:
-    "Create, update or delete one file. For create_file and update_file, diff is a V4A diff: lines prefixed '+' add, '-' remove and ' ' keep, with '@@' context headers for updates. A create_file diff contains only '+' lines. delete_file takes no diff.",
+    "Create, update or delete one file. create_file and update_file require diff, a V4A diff: lines prefixed '+' add, '-' remove and ' ' keep, with '@@' context headers for updates. A create_file diff contains only '+' lines. delete_file takes no diff.",
   parameters: {
     type: "object",
     properties: {
@@ -62,10 +62,14 @@ export const applyPatchOperationOf = (
   const { type, path, diff } = parsed as Record<string, unknown>;
   if (typeof type !== "string" || !OPERATION_TYPES.has(type)) return undefined;
   if (typeof path !== "string") return undefined;
+  // create_file and update_file carry their content in the diff; the Agents
+  // SDK rejects either without one.
+  const hasDiff = typeof diff === "string" && diff.length > 0;
+  if (type !== "delete_file" && !hasDiff) return undefined;
   return {
     type: type as TApplyPatchOperation["type"],
     path,
-    ...(typeof diff === "string" ? { diff } : {}),
+    ...(hasDiff ? { diff } : {}),
   };
 };
 

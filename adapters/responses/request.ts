@@ -158,6 +158,32 @@ const isAllowedTool = (
   );
 
 /**
+ * A namespace tool narrowed by `allowed_tools`: kept whole when the namespace
+ * itself is allowed, otherwise cut down to its allowed function members (by
+ * bare or canonical joined name), and dropped when none remain.
+ */
+const narrowNamespace = (
+  tool: TResponsesToolEntry,
+  allowed: ReadonlyArray<TAllowedToolRef>,
+): TResponsesToolEntry[] => {
+  if (isAllowedTool(tool, allowed)) return [tool];
+  const members = (tool as { tools?: unknown }).tools;
+  if (typeof tool.name !== "string" || !Array.isArray(members)) return [];
+  const ns = tool.name;
+  const kept = members.filter(
+    (m) =>
+      isFunctionTool(m) &&
+      allowed.some(
+        (ref) =>
+          ref.type === "function" &&
+          (ref.name === m.name ||
+            ref.name === joinNamespacedToolName(ns, m.name as string)),
+      ),
+  );
+  return kept.length === 0 ? [] : [{ ...tool, tools: kept }];
+};
+
+/**
  * Normalize the declared tools before anything reads them:
  *  - `tool_choice: allowed_tools` narrows the declared list to the allowed
  *    subset (no upstream but OpenAI's own API takes the choice itself; the
@@ -174,7 +200,13 @@ const normalizeTools = (
     choice != null &&
     typeof choice !== "string" &&
     choice.type === "allowed_tools"
-      ? tools.filter((t) => isAllowedTool(t, choice.tools))
+      ? tools.flatMap((t) =>
+          t.type === "namespace"
+            ? narrowNamespace(t, choice.tools)
+            : isAllowedTool(t, choice.tools)
+              ? [t]
+              : [],
+        )
       : tools;
   return narrowed.map((t) =>
     isHostedApplyPatchTool(t) ? applyPatchFunctionTool : t,

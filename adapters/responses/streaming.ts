@@ -45,8 +45,11 @@ type TFunctionItem = {
   /**
    * A call to the hosted `apply_patch` stand-in: it streams silently and is
    * announced whole at the end, once its arguments parse into an operation.
+   * Decided when the function name arrives, which may be after the first chunk.
    */
-  readonly applyPatch: boolean;
+  applyPatch: boolean;
+  /** Whether `output_item.added` has been sent (deferred until the name is known). */
+  announced: boolean;
 };
 type TOutputItem = TMessageItem | TFunctionItem;
 
@@ -152,7 +155,7 @@ export const chunksToResponsesSseBytes = (
               return;
             }
             for (const it of order) {
-              if (it.kind === "function_call" && it.applyPatch) {
+              if (it.kind === "function_call" && !it.announced) {
                 tail.push(
                   ev("response.output_item.added", {
                     output_index: it.outputIndex,
@@ -245,11 +248,23 @@ export const chunksToResponsesSseBytes = (
                 callId,
                 name: tc.function?.name ?? "",
                 args: "",
-                applyPatch: tc.function?.name === APPLY_PATCH_FUNCTION_NAME,
+                applyPatch: false,
+                announced: false,
               };
               toolItems.set(tc.index, item);
               order.push(item);
-              if (!item.applyPatch)
+            }
+            if (
+              tc.function?.name != null &&
+              tc.function.name.length > 0 &&
+              item.name === ""
+            ) {
+              item.name = tc.function.name;
+            }
+            if (!item.announced && item.name !== "" && !item.applyPatch) {
+              item.applyPatch = item.name === APPLY_PATCH_FUNCTION_NAME;
+              if (!item.applyPatch) {
+                item.announced = true;
                 out.push(
                   ev("response.output_item.added", {
                     output_index: item.outputIndex,
@@ -262,18 +277,21 @@ export const chunksToResponsesSseBytes = (
                     },
                   }),
                 );
-            }
-            if (
-              tc.function?.name != null &&
-              tc.function.name.length > 0 &&
-              item.name === ""
-            ) {
-              item.name = tc.function.name;
+                // Arguments that streamed before the name arrived.
+                if (item.args.length > 0)
+                  out.push(
+                    ev("response.function_call_arguments.delta", {
+                      item_id: item.id,
+                      output_index: item.outputIndex,
+                      delta: item.args,
+                    }),
+                  );
+              }
             }
             const argsDelta = tc.function?.arguments;
             if (typeof argsDelta === "string" && argsDelta.length > 0) {
               item.args += argsDelta;
-              if (!item.applyPatch)
+              if (item.announced)
                 out.push(
                   ev("response.function_call_arguments.delta", {
                     item_id: item.id,
