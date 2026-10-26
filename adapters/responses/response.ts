@@ -4,6 +4,10 @@ import type {
   TResponsesResponse,
 } from "@openllmsh/protocol";
 import { extractMessageText } from "../../lib/canonical/message";
+import {
+  APPLY_PATCH_FUNCTION_NAME,
+  toApplyPatchCallItem,
+} from "../../lib/responses-apply-patch";
 import { responsesCallIdentity } from "../../lib/responses-namespace";
 import {
   reasoningItemsFromUnknown,
@@ -49,6 +53,14 @@ export const toResponsesResponse = (
 
   if (msg?.tool_calls != null) {
     for (const tc of msg.tool_calls) {
+      const applyPatch =
+        tc.function.name === APPLY_PATCH_FUNCTION_NAME
+          ? toApplyPatchCallItem(`fc_${tc.id}`, tc.id, tc.function.arguments)
+          : undefined;
+      if (applyPatch !== undefined) {
+        output.push(applyPatch);
+        continue;
+      }
       output.push({
         type: "function_call",
         id: `fc_${tc.id}`,

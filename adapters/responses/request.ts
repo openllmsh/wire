@@ -7,6 +7,11 @@ import type {
 } from "@openllmsh/protocol";
 import type { TCanonicalContentPart } from "../../lib/canonical/content-part";
 import {
+  APPLY_PATCH_FUNCTION_NAME,
+  applyPatchFunctionTool,
+  isHostedApplyPatchTool,
+} from "../../lib/responses-apply-patch";
+import {
   canonicalToolNameOf,
   joinNamespacedToolName,
 } from "../../lib/responses-namespace";
@@ -131,10 +136,59 @@ const mapTools = (
 
 const mapToolChoice = (
   choice: TResponsesRequest["tool_choice"],
-): TChatCompletionRequest["tool_choice"] =>
-  choice == null || typeof choice === "string"
-    ? (choice ?? undefined)
-    : { type: "function", function: { name: choice.name } };
+): TChatCompletionRequest["tool_choice"] => {
+  if (choice == null || typeof choice === "string") return choice ?? undefined;
+  if (choice.type === "allowed_tools") return choice.mode;
+  if (choice.type === "apply_patch") {
+    return { type: "function", function: { name: APPLY_PATCH_FUNCTION_NAME } };
+  }
+  return { type: "function", function: { name: choice.name } };
+};
+
+type TAllowedToolRef = { readonly type: string; readonly name?: string };
+
+const isAllowedTool = (
+  tool: TResponsesToolEntry,
+  allowed: ReadonlyArray<TAllowedToolRef>,
+): boolean =>
+  allowed.some(
+    (ref) =>
+      ref.type === tool.type &&
+      (ref.name === undefined || ref.name === tool.name),
+  );
+
+/**
+ * Normalize the declared tools before anything reads them:
+ *  - `tool_choice: allowed_tools` narrows the declared list to the allowed
+ *    subset (no upstream but OpenAI's own API takes the choice itself; the
+ *    narrowed list gives the same turn semantics at the cost of the tool
+ *    prefix's prompt-cache hit).
+ *  - the hosted `apply_patch` tool becomes its function stand-in, which every
+ *    upstream can call (`lib/responses-apply-patch.ts`).
+ */
+const normalizeTools = (
+  tools: ReadonlyArray<TResponsesToolEntry>,
+  choice: TResponsesRequest["tool_choice"],
+): TResponsesToolEntry[] => {
+  const narrowed =
+    choice != null &&
+    typeof choice !== "string" &&
+    choice.type === "allowed_tools"
+      ? tools.filter((t) => isAllowedTool(t, choice.tools))
+      : tools;
+  return narrowed.map((t) =>
+    isHostedApplyPatchTool(t) ? applyPatchFunctionTool : t,
+  );
+};
+
+/** A replayed `apply_patch_call` output's status + text as a tool result. */
+const applyPatchOutputText = (
+  status: string | undefined,
+  output: string | null | undefined,
+): string =>
+  output != null && output.length > 0
+    ? `${status ?? "completed"}: ${output}`
+    : (status ?? "completed");
 
 /** Codex sends `minimal`; the canonical enum has it, so pass effort through. */
 const mapEffort = (
@@ -153,7 +207,8 @@ export const fromResponsesRequest = (
   // leading input items as DISTINCT opaque carriers: their placement changes
   // the ChatGPT/Codex upstream contract. Flat top-level functions and the
   // members of namespace tools (from either place) map to canonical `tools`.
-  const responsesTools = req.tools == null ? [] : [...req.tools];
+  const responsesTools =
+    req.tools == null ? [] : normalizeTools(req.tools, req.tool_choice);
   const responsesAdditionalTools: unknown[] = [];
 
   const instr = req.instructions;
@@ -202,6 +257,28 @@ export const fromResponsesRequest = (
           role: "tool",
           tool_call_id: item.call_id,
           content: contentToText(item.output),
+        });
+      } else if (item.type === "apply_patch_call") {
+        messages.push({
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: item.call_id,
+              type: "function",
+              function: {
+                name: APPLY_PATCH_FUNCTION_NAME,
+                arguments: JSON.stringify(item.operation ?? {}),
+              },
+            },
+          ],
+          ...takeReasoning(),
+        });
+      } else if (item.type === "apply_patch_call_output") {
+        messages.push({
+          role: "tool",
+          tool_call_id: item.call_id,
+          content: applyPatchOutputText(item.status, item.output),
         });
       } else {
         // message item
