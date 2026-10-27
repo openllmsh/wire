@@ -18,6 +18,7 @@ export * from "./features/compaction/compaction-text";
 export * from "./features/context-demote";
 export * from "./features/context-overflow-strategy";
 export * from "./features/context-skip";
+export * from "./features/conversation-affinity";
 export * from "./features/max-tokens-backfill";
 export * from "./features/model-caps";
 export * from "./features/quota-gate";
