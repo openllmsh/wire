@@ -1,4 +1,8 @@
 import type { TChatCompletionChunk } from "@openllmsh/protocol";
+import {
+  APPLY_PATCH_FUNCTION_NAME,
+  toApplyPatchCallItem,
+} from "../../lib/responses-apply-patch";
 import { responsesCallIdentity } from "../../lib/responses-namespace";
 import { upstreamErrorFrom } from "../../lib/streaming/upstream-error";
 
@@ -38,8 +42,25 @@ type TFunctionItem = {
   readonly callId: string;
   name: string;
   args: string;
+  /**
+   * A call to the hosted `apply_patch` stand-in: it streams silently and is
+   * announced whole at the end, once its arguments parse into an operation.
+   * Decided when the function name arrives, which may be after the first chunk.
+   */
+  applyPatch: boolean;
+  /** Whether `output_item.added` has been sent (deferred until the name is known). */
+  announced: boolean;
 };
 type TOutputItem = TMessageItem | TFunctionItem;
+
+const functionCallJson = (it: TFunctionItem): Record<string, unknown> => ({
+  type: "function_call",
+  id: it.id,
+  call_id: it.callId,
+  ...responsesCallIdentity(it.name),
+  arguments: it.args,
+  status: "completed",
+});
 
 const itemJson = (it: TOutputItem): unknown =>
   it.kind === "message"
@@ -50,14 +71,10 @@ const itemJson = (it: TOutputItem): unknown =>
         role: "assistant",
         content: [{ type: "output_text", text: it.text, annotations: [] }],
       }
-    : {
-        type: "function_call",
-        id: it.id,
-        call_id: it.callId,
-        ...responsesCallIdentity(it.name),
-        arguments: it.args,
-        status: "completed",
-      };
+    : it.applyPatch
+      ? (toApplyPatchCallItem(it.id, it.callId, it.args) ??
+        functionCallJson(it))
+      : functionCallJson(it);
 
 export const chunksToResponsesSseBytes = (
   chunks: ReadableStream<TChatCompletionChunk>,
@@ -138,6 +155,14 @@ export const chunksToResponsesSseBytes = (
               return;
             }
             for (const it of order) {
+              if (it.kind === "function_call" && !it.announced) {
+                tail.push(
+                  ev("response.output_item.added", {
+                    output_index: it.outputIndex,
+                    item: itemJson(it),
+                  }),
+                );
+              }
               tail.push(
                 ev("response.output_item.done", {
                   output_index: it.outputIndex,
@@ -223,21 +248,11 @@ export const chunksToResponsesSseBytes = (
                 callId,
                 name: tc.function?.name ?? "",
                 args: "",
+                applyPatch: false,
+                announced: false,
               };
               toolItems.set(tc.index, item);
               order.push(item);
-              out.push(
-                ev("response.output_item.added", {
-                  output_index: item.outputIndex,
-                  item: {
-                    type: "function_call",
-                    id: item.id,
-                    call_id: item.callId,
-                    ...responsesCallIdentity(item.name),
-                    arguments: "",
-                  },
-                }),
-              );
             }
             if (
               tc.function?.name != null &&
@@ -246,16 +261,44 @@ export const chunksToResponsesSseBytes = (
             ) {
               item.name = tc.function.name;
             }
+            if (!item.announced && item.name !== "" && !item.applyPatch) {
+              item.applyPatch = item.name === APPLY_PATCH_FUNCTION_NAME;
+              if (!item.applyPatch) {
+                item.announced = true;
+                out.push(
+                  ev("response.output_item.added", {
+                    output_index: item.outputIndex,
+                    item: {
+                      type: "function_call",
+                      id: item.id,
+                      call_id: item.callId,
+                      ...responsesCallIdentity(item.name),
+                      arguments: "",
+                    },
+                  }),
+                );
+                // Arguments that streamed before the name arrived.
+                if (item.args.length > 0)
+                  out.push(
+                    ev("response.function_call_arguments.delta", {
+                      item_id: item.id,
+                      output_index: item.outputIndex,
+                      delta: item.args,
+                    }),
+                  );
+              }
+            }
             const argsDelta = tc.function?.arguments;
             if (typeof argsDelta === "string" && argsDelta.length > 0) {
               item.args += argsDelta;
-              out.push(
-                ev("response.function_call_arguments.delta", {
-                  item_id: item.id,
-                  output_index: item.outputIndex,
-                  delta: argsDelta,
-                }),
-              );
+              if (item.announced)
+                out.push(
+                  ev("response.function_call_arguments.delta", {
+                    item_id: item.id,
+                    output_index: item.outputIndex,
+                    delta: argsDelta,
+                  }),
+                );
             }
           }
 

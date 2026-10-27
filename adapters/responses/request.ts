@@ -7,6 +7,11 @@ import type {
 } from "@openllmsh/protocol";
 import type { TCanonicalContentPart } from "../../lib/canonical/content-part";
 import {
+  APPLY_PATCH_FUNCTION_NAME,
+  applyPatchFunctionTool,
+  isHostedApplyPatchTool,
+} from "../../lib/responses-apply-patch";
+import {
   canonicalToolNameOf,
   joinNamespacedToolName,
 } from "../../lib/responses-namespace";
@@ -131,10 +136,97 @@ const mapTools = (
 
 const mapToolChoice = (
   choice: TResponsesRequest["tool_choice"],
-): TChatCompletionRequest["tool_choice"] =>
-  choice == null || typeof choice === "string"
-    ? (choice ?? undefined)
-    : { type: "function", function: { name: choice.name } };
+): TChatCompletionRequest["tool_choice"] => {
+  if (choice == null || typeof choice === "string") return choice ?? undefined;
+  if (choice.type === "allowed_tools") return choice.mode;
+  if (choice.type === "apply_patch") {
+    return { type: "function", function: { name: APPLY_PATCH_FUNCTION_NAME } };
+  }
+  return { type: "function", function: { name: choice.name } };
+};
+
+type TAllowedToolRef = { readonly type: string; readonly name?: string };
+
+const isAllowedTool = (
+  tool: TResponsesToolEntry,
+  allowed: ReadonlyArray<TAllowedToolRef>,
+): boolean =>
+  allowed.some(
+    (ref) =>
+      ref.type === tool.type &&
+      (ref.name === undefined || ref.name === tool.name),
+  );
+
+/**
+ * A namespace tool narrowed by `allowed_tools`: kept whole when the namespace
+ * itself is allowed, otherwise cut down to its allowed function members (by
+ * bare or canonical joined name), and dropped when none remain.
+ */
+const narrowNamespace = (
+  tool: TResponsesToolEntry,
+  allowed: ReadonlyArray<TAllowedToolRef>,
+): TResponsesToolEntry[] => {
+  if (isAllowedTool(tool, allowed)) return [tool];
+  const members = (tool as { tools?: unknown }).tools;
+  if (typeof tool.name !== "string" || !Array.isArray(members)) return [];
+  const ns = tool.name;
+  const kept = members.filter(
+    (m) =>
+      isFunctionTool(m) &&
+      allowed.some(
+        (ref) =>
+          ref.type === "function" &&
+          (ref.name === m.name ||
+            ref.name === joinNamespacedToolName(ns, m.name as string)),
+      ),
+  );
+  return kept.length === 0 ? [] : [{ ...tool, tools: kept }];
+};
+
+/**
+ * Normalize the declared tools before anything reads them:
+ *  - `tool_choice: allowed_tools` narrows the declared list to the allowed
+ *    subset (no upstream but OpenAI's own API takes the choice itself; the
+ *    narrowed list gives the same turn semantics at the cost of the tool
+ *    prefix's prompt-cache hit).
+ *  - the hosted `apply_patch` tool becomes its function stand-in, which every
+ *    upstream can call (`lib/responses-apply-patch.ts`).
+ */
+/** Tools left callable by `tool_choice: allowed_tools` (all of them otherwise). */
+const narrowToAllowed = (
+  tools: ReadonlyArray<TResponsesToolEntry>,
+  choice: TResponsesRequest["tool_choice"],
+): TResponsesToolEntry[] =>
+  choice != null &&
+  typeof choice !== "string" &&
+  choice.type === "allowed_tools"
+    ? tools.flatMap((t) =>
+        t.type === "namespace"
+          ? narrowNamespace(t, choice.tools)
+          : isAllowedTool(t, choice.tools)
+            ? [t]
+            : [],
+      )
+    : [...tools];
+
+const normalizeTools = (
+  tools: ReadonlyArray<TResponsesToolEntry>,
+  choice: TResponsesRequest["tool_choice"],
+): TResponsesToolEntry[] => {
+  const narrowed = narrowToAllowed(tools, choice);
+  return narrowed.map((t) =>
+    isHostedApplyPatchTool(t) ? applyPatchFunctionTool : t,
+  );
+};
+
+/** A replayed `apply_patch_call` output's status + text as a tool result. */
+const applyPatchOutputText = (
+  status: string | undefined,
+  output: string | null | undefined,
+): string =>
+  output != null && output.length > 0
+    ? `${status ?? "completed"}: ${output}`
+    : (status ?? "completed");
 
 /** Codex sends `minimal`; the canonical enum has it, so pass effort through. */
 const mapEffort = (
@@ -153,7 +245,8 @@ export const fromResponsesRequest = (
   // leading input items as DISTINCT opaque carriers: their placement changes
   // the ChatGPT/Codex upstream contract. Flat top-level functions and the
   // members of namespace tools (from either place) map to canonical `tools`.
-  const responsesTools = req.tools == null ? [] : [...req.tools];
+  const responsesTools =
+    req.tools == null ? [] : normalizeTools(req.tools, req.tool_choice);
   const responsesAdditionalTools: unknown[] = [];
 
   const instr = req.instructions;
@@ -180,8 +273,17 @@ export const fromResponsesRequest = (
       } else if (item.type === "additional_tools") {
         // Preserve the entire input item rather than hoisting its nested tools.
         // The Codex upstream distinguishes harness declarations in input from
-        // model-facing tools at the top level.
-        responsesAdditionalTools.push(item);
+        // model-facing tools at the top level. `allowed_tools` narrows it too,
+        // so an excluded harness tool doesn't stay callable through it.
+        const tools = narrowToAllowed(item.tools, req.tool_choice);
+        if (tools.length > 0) {
+          responsesAdditionalTools.push(
+            tools.length === item.tools.length &&
+              tools.every((t, i) => t === item.tools[i])
+              ? item
+              : { ...item, tools },
+          );
+        }
       } else if (item.type === "function_call") {
         const toolCall: TToolCall = {
           id: item.call_id,
@@ -202,6 +304,28 @@ export const fromResponsesRequest = (
           role: "tool",
           tool_call_id: item.call_id,
           content: contentToText(item.output),
+        });
+      } else if (item.type === "apply_patch_call") {
+        messages.push({
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: item.call_id,
+              type: "function",
+              function: {
+                name: APPLY_PATCH_FUNCTION_NAME,
+                arguments: JSON.stringify(item.operation ?? {}),
+              },
+            },
+          ],
+          ...takeReasoning(),
+        });
+      } else if (item.type === "apply_patch_call_output") {
+        messages.push({
+          role: "tool",
+          tool_call_id: item.call_id,
+          content: applyPatchOutputText(item.status, item.output),
         });
       } else {
         // message item
