@@ -8,7 +8,9 @@
 
 const SK_LIKE = /\b(?:sk|rk|key)[-_][A-Za-z0-9_-]{8,}\b/gi;
 const BEARER_LIKE = /\bBearer\s+[A-Za-z0-9._\-+/=]{8,}/gi;
-const LAST4_HINT = /\b(?:\*{2,}|•{2,}|\.{2,}|x{2,})[A-Za-z0-9]{4}\b/gi;
+// Symbol masks start with a non-word char, so a leading \b would only match
+// when a letter precedes the mask; keep the boundary for the `xx` form only.
+const LAST4_HINT = /(?:\*{2,}|•{2,}|\.{2,}|…|\bx{2,})[A-Za-z0-9]{4}\b/gi;
 
 const escapeRegExp = (value: string): string =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
