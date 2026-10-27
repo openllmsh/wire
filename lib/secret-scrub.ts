@@ -28,6 +28,9 @@ export const scrubSecretText = (
   for (const secret of secrets) {
     if (secret.length === 0) continue;
     out = out.split(secret).join("[redacted]");
+    // URL secrets (a custom base_url): exact removal only — the prefix/tail
+    // heuristics below would match every URL with the same scheme or TLD.
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(secret)) continue;
     if (secret.length >= 4) {
       const last4 = secret.slice(-4);
       const last4Re = new RegExp(
