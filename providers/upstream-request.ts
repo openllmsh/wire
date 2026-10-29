@@ -139,14 +139,36 @@ const isToolAdditionBlock = (block: unknown): boolean =>
   block !== null &&
   (block as { readonly type?: unknown }).type === "tool_addition";
 
+/** The tool a `tool_addition` block carries (`{type:"tool_definition",
+ *  definition}`), or null for any other shape. */
+const toolAdditionDefinition = (
+  block: unknown,
+): Record<string, unknown> | null => {
+  const tool = (block as { readonly tool?: unknown }).tool;
+  if (typeof tool !== "object" || tool === null) return null;
+  const definition = (tool as { readonly definition?: unknown }).definition;
+  return typeof definition === "object" && definition !== null
+    ? (definition as Record<string, unknown>)
+    : null;
+};
+
+const toolNameOf = (tool: unknown): unknown =>
+  typeof tool === "object" && tool !== null
+    ? (tool as { readonly name?: unknown }).name
+    : undefined;
+
 /**
  * A `tool_addition` block (`inline-tools-2026-09-15`) is valid only inside an
  * inline system turn — hoisted into top-level `system` it 400s every later
- * request in the session (`system.N.type: Input should be 'text'`). It stays in
- * place as a system turn of just those blocks; everything else is hoisted.
+ * request in the session (`system.N.type: Input should be 'text'`). On a model
+ * that accepts it (`caps.inlineToolAdditions` not false) it stays in place as a
+ * system turn of just those blocks. On one that doesn't, its definition joins
+ * top-level `tools` (appended, deduped by name) — the shape a client without
+ * the beta would send. Everything else is hoisted.
  */
 const hoistInlineAnthropicSystemMessages = (
   body: Record<string, unknown>,
+  caps: TModelCaps | undefined,
 ): Record<string, unknown> => {
   if (!Array.isArray(body.messages)) return body;
   if (!body.messages.some(isInlineSystemMessage)) return body;
@@ -157,7 +179,9 @@ const hoistInlineAnthropicSystemMessages = (
       : Array.isArray(body.system)
         ? body.system
         : [];
+  const keepInline = caps?.inlineToolAdditions !== false;
   const hoistedSystem: unknown[] = [];
+  const addedTools: unknown[] = [];
   const messages: unknown[] = [];
   for (const message of body.messages) {
     if (!isInlineSystemMessage(message)) {
@@ -170,15 +194,32 @@ const hoistInlineAnthropicSystemMessages = (
     for (const block of blocks)
       if (!isToolAdditionBlock(block))
         hoistedSystem.push(stripInlineSystemCacheMarker(block));
-    const kept = blocks.filter(isToolAdditionBlock);
-    if (kept.length > 0)
-      messages.push({ ...(message as object), content: kept });
+    const additions = blocks.filter(isToolAdditionBlock);
+    const unconvertible = keepInline
+      ? additions
+      : additions.filter((block) => toolAdditionDefinition(block) === null);
+    if (!keepInline)
+      for (const block of additions) {
+        const definition = toolAdditionDefinition(block);
+        if (definition !== null) addedTools.push(definition);
+      }
+    if (unconvertible.length > 0)
+      messages.push({
+        ...(message as object),
+        content: unconvertible.map(stripInlineSystemCacheMarker),
+      });
   }
 
+  const existingTools = Array.isArray(body.tools) ? body.tools : [];
+  const existingNames = new Set(existingTools.map(toolNameOf));
+  const newTools = addedTools.filter(
+    (tool) => !existingNames.has(toolNameOf(tool)),
+  );
   return {
     ...body,
     system: [...existingSystem, ...hoistedSystem],
     messages,
+    ...(newTools.length > 0 ? { tools: [...existingTools, ...newTools] } : {}),
   };
 };
 
@@ -295,6 +336,7 @@ export const buildUpstreamBody = (
         ? normaliseAdaptiveThinking(
             hoistInlineAnthropicSystemMessages(
               normaliseAnthropicNativeTools(pinned),
+              caps,
             ),
             caps,
           )
