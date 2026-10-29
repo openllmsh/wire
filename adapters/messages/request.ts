@@ -183,6 +183,7 @@ const CROSS_WIRE_UNSUPPORTED_BLOCK_TYPES: ReadonlySet<string> = new Set([
   "mcp_tool_result",
   "tool_reference",
   "browser_state",
+  "tool_addition",
 ]);
 
 const blocksToCanonicalContent = (
