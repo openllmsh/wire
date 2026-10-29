@@ -129,18 +129,27 @@ const stripInlineSystemCacheMarker = (block: unknown): unknown => {
   return rest;
 };
 
+const isInlineSystemMessage = (message: unknown): boolean =>
+  typeof message === "object" &&
+  message !== null &&
+  (message as { readonly role?: unknown }).role === "system";
+
+const isToolAdditionBlock = (block: unknown): boolean =>
+  typeof block === "object" &&
+  block !== null &&
+  (block as { readonly type?: unknown }).type === "tool_addition";
+
+/**
+ * A `tool_addition` block (`inline-tools-2026-09-15`) is valid only inside an
+ * inline system turn — hoisted into top-level `system` it 400s every later
+ * request in the session (`system.N.type: Input should be 'text'`). It stays in
+ * place as a system turn of just those blocks; everything else is hoisted.
+ */
 const hoistInlineAnthropicSystemMessages = (
   body: Record<string, unknown>,
 ): Record<string, unknown> => {
   if (!Array.isArray(body.messages)) return body;
-
-  const inlineSystemMessages = body.messages.filter(
-    (message) =>
-      typeof message === "object" &&
-      message !== null &&
-      (message as { readonly role?: unknown }).role === "system",
-  );
-  if (inlineSystemMessages.length === 0) return body;
+  if (!body.messages.some(isInlineSystemMessage)) return body;
 
   const existingSystem =
     typeof body.system === "string"
@@ -148,23 +157,28 @@ const hoistInlineAnthropicSystemMessages = (
       : Array.isArray(body.system)
         ? body.system
         : [];
-  const hoistedSystem = inlineSystemMessages.flatMap((message) =>
-    inlineAnthropicSystemContent(
+  const hoistedSystem: unknown[] = [];
+  const messages: unknown[] = [];
+  for (const message of body.messages) {
+    if (!isInlineSystemMessage(message)) {
+      messages.push(message);
+      continue;
+    }
+    const blocks = inlineAnthropicSystemContent(
       (message as { readonly content?: unknown }).content,
-    ).map((contentBlock) => stripInlineSystemCacheMarker(contentBlock)),
-  );
+    );
+    for (const block of blocks)
+      if (!isToolAdditionBlock(block))
+        hoistedSystem.push(stripInlineSystemCacheMarker(block));
+    const kept = blocks.filter(isToolAdditionBlock);
+    if (kept.length > 0)
+      messages.push({ ...(message as object), content: kept });
+  }
 
   return {
     ...body,
     system: [...existingSystem, ...hoistedSystem],
-    messages: body.messages.filter(
-      (message) =>
-        !(
-          typeof message === "object" &&
-          message !== null &&
-          (message as { readonly role?: unknown }).role === "system"
-        ),
-    ),
+    messages,
   };
 };
 
