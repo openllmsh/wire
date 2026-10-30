@@ -212,9 +212,12 @@ const hoistInlineAnthropicSystemMessages = (
 
   const existingTools = Array.isArray(body.tools) ? body.tools : [];
   const existingNames = new Set(existingTools.map(toolNameOf));
-  const newTools = addedTools.filter(
-    (tool) => !existingNames.has(toolNameOf(tool)),
-  );
+  const newTools = addedTools.filter((tool) => {
+    const name = toolNameOf(tool);
+    if (existingNames.has(name)) return false;
+    existingNames.add(name);
+    return true;
+  });
   return {
     ...body,
     system: [...existingSystem, ...hoistedSystem],
